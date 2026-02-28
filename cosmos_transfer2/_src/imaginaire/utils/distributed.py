@@ -46,6 +46,31 @@ def init() -> int | None:
     if dist.is_initialized():
         return torch.cuda.current_device()
 
+    # Check if running in distributed mode by checking for RANK environment variable
+    rank_env = os.getenv("RANK")
+
+    # If RANK is not set, assume single GPU/non-distributed mode
+    if rank_env is None:
+        local_rank = int(os.getenv("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            log.info(f"Running in single GPU mode, initializing distributed with one process on device {local_rank}")
+            # Initialize single-process distributed environment for compatibility
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "12355"
+            os.environ["LOCAL_RANK"] = str(local_rank)
+            # Initialize process group with a single process
+            timeout_timedelta = timedelta(seconds=1800)
+            dist.init_process_group(
+                backend="nccl", init_method="env://", timeout=timeout_timedelta, rank=0, world_size=1
+            )
+            log.info("Initialized single-process distributed environment")
+        else:
+            log.info("Running in CPU mode (distributed not initialized)")
+        return local_rank if torch.cuda.is_available() else None
+
     # Set GPU affinity.
     pynvml.nvmlInit()
     local_rank = int(os.getenv("LOCAL_RANK", 0))

@@ -15,11 +15,13 @@
 
 
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import torch.distributed as dist
+import torch.utils.data
 from hydra.core.config_store import ConfigStore
 
 from cosmos_transfer2._src.imaginaire.flags import SMOKE
@@ -35,6 +37,7 @@ from cosmos_transfer2._src.predict2_multiview.datasets.multiview import (
     AGIBOT_VIEWS,
     AugmentationConfig,
     collate_fn,
+    make_augmentations,
 )
 from cosmos_transfer2._src.transfer2.datasets.augmentors.control_input import AddControlInputBlur, AddControlInputEdge
 
@@ -224,6 +227,126 @@ class AgibotMultiviewLocalDataset(LocalMultiViewDataset):
         return data
 
 
+class WaymoMultiviewDataset(LocalMultiViewDataset):
+    def __init__(
+        self,
+        dataset_dir: str,
+        caption_json_path: str,
+        augmentation_config: AugmentationConfig,
+        folder_to_camera_key: dict[str, str],
+        control_dir_name: str = "world_scenario",
+    ) -> None:
+        self.dataset_dir = Path(dataset_dir)
+        self.augmentation_config = augmentation_config
+        self.folder_to_camera_key = folder_to_camera_key
+        self.control_dir_name = control_dir_name
+
+        print(f"Loading captions from {caption_json_path}...")
+        with open(caption_json_path, "r") as f:
+            self.captions_data = json.load(f)
+        print(f"Loaded {len(self.captions_data)} caption entries")
+
+        video_path = self.dataset_dir / "videos"
+        control_path = self.dataset_dir / control_dir_name
+
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video directory {video_path} does not exist!")
+        if not control_path.exists():
+            raise FileNotFoundError(f"Control directory {control_path} does not exist!")
+
+        first_camera_folder = list(folder_to_camera_key.keys())[0]
+        reference_dir = video_path / first_camera_folder
+
+        if not reference_dir.exists():
+            raise FileNotFoundError(f"Reference camera directory {reference_dir} does not exist!")
+
+        video_files = sorted(reference_dir.glob("*.mp4"))
+        unique_names = [f.stem for f in video_files]
+
+        print(f"Found {len(unique_names)} video samples in {reference_dir}")
+
+        video_files_dict = defaultdict(dict)
+        control_files_dict = defaultdict(dict)
+        captions_dict = defaultdict(dict)
+
+        for name in unique_names:
+            for folder, camera_key in self.folder_to_camera_key.items():
+                video_file = video_path / folder / f"{name}.mp4"
+                if not video_file.exists():
+                    continue
+                video_files_dict[name][camera_key] = video_file
+
+                control_file = control_path / folder / f"{name}.mp4"
+                if not control_file.exists():
+                    continue
+                control_files_dict[name][camera_key] = control_file
+
+                caption_key = f"{name[:-2]}_{folder}"
+                if caption_key not in self.captions_data:
+                    continue
+                captions_dict[name][camera_key] = self.captions_data[caption_key]
+
+        self.video_file_dicts = [video_files_dict[name] for name in unique_names]
+        self.control_file_dicts = [control_files_dict[name] for name in unique_names]
+        self.captions_dict_list = [captions_dict[name] for name in unique_names]
+
+        # Total frames per video clip (used for random window sampling in __getitem__).
+        # Adjust this if your videos have a different length.
+        self.total_video_frames = 190
+
+        torch.utils.data.Dataset.__init__(self)
+        self.augmentations, self.dataset_keys = make_augmentations(augmentation_config)
+
+    def __getitem__(self, index: int) -> dict:
+        data_dict = {
+            "__key__": str(index),
+            "__url__": "waymo_local_dataset",
+        }
+
+        for view_key, filepath in self.video_file_dicts[index].items():
+            if filepath is None:
+                raise ValueError(f"view_key {view_key} has null filepath!")
+            video_key = self.augmentation_config.camera_video_key_mapping[view_key]
+            with open(filepath, "rb") as f:
+                data_dict[video_key] = f.read()
+
+        if self.control_file_dicts is not None:
+            for view_key, filepath in self.control_file_dicts[index].items():
+                if filepath is None:
+                    raise ValueError(f"view_key {view_key} has null filepath!")
+                control_key = self.augmentation_config.camera_control_key_mapping[view_key]
+                with open(filepath, "rb") as f:
+                    data_dict[control_key] = f.read()
+
+        # Sample a single random offset shared across ALL cameras to ensure frame alignment.
+        # max_offset = total_video_frames - num_video_frames (190 - 29 = 161)
+        max_offset = max(0, self.total_video_frames - self.augmentation_config.num_video_frames)
+        frame_offset = random.randint(0, max_offset) if max_offset > 0 else 0
+        frame_start = frame_offset
+        frame_end = frame_offset + self.augmentation_config.num_video_frames
+
+        captions_for_sample = self.captions_dict_list[index]
+        for camera_key in self.augmentation_config.camera_keys:
+            caption_text = captions_for_sample.get(camera_key, "A driving scene from an autonomous vehicle.")
+
+            caption_styles = dict(
+                zip(
+                    self.augmentation_config.caption_probability.keys(),
+                    [caption_text for _ in range(len(self.augmentation_config.caption_probability))],
+                )
+            )
+
+            caption_key_name = self.augmentation_config.camera_caption_key_mapping[camera_key]
+            data_dict[caption_key_name] = {
+                "t2w_windows": [{"start_frame": frame_start, "end_frame": frame_end, **caption_styles}]
+            }
+
+        for k, aug in self.augmentations.items():
+            data_dict = aug(data_dict)
+
+        return data_dict
+
+
 #  NOTE 1: For customized post train: add your dataloader registration here.
 def register_dataloader_local() -> None:
     from cosmos_transfer2._src.predict2_multiview.datasets.multiview import (
@@ -308,3 +431,95 @@ def register_dataloader_local() -> None:
                 pin_memory=True,
             ),
         )
+
+    WAYMO_CAMERAS = (
+        "pinhole_front",
+        "pinhole_front_left",
+        "pinhole_front_right",
+        "pinhole_side_left",
+        "pinhole_side_right",
+    )
+
+    WAYMO_CAMERA_VIEW_MAPPING = dict(zip(WAYMO_CAMERAS, range(len(WAYMO_CAMERAS))))
+    WAYMO_VIDEO_KEY_MAPPING = {cam: f"video_{cam}" for cam in WAYMO_CAMERAS}
+    WAYMO_CAPTION_KEY_MAPPING = {cam: f"metas_{cam}" for cam in WAYMO_CAMERAS}
+    WAYMO_CAPTION_PREFIXES = {
+        "pinhole_front": "The video is captured from the front camera.",
+        "pinhole_front_left": "The video is captured from the front-left camera.",
+        "pinhole_front_right": "The video is captured from the front-right camera.",
+        "pinhole_side_left": "The video is captured from the left side camera.",
+        "pinhole_side_right": "The video is captured from the right side camera.",
+    }
+
+    waymo_augmentation_config = L(AugmentationConfig)(
+        resolution_hw=(720, 1280),
+        fps_downsample_factor=1,
+        num_video_frames=29,
+        camera_keys=WAYMO_CAMERAS if not SMOKE else WAYMO_CAMERAS[:1],
+        camera_view_mapping=WAYMO_CAMERA_VIEW_MAPPING,
+        camera_video_key_mapping=WAYMO_VIDEO_KEY_MAPPING,
+        camera_caption_key_mapping=WAYMO_CAPTION_KEY_MAPPING,
+        caption_probability={"dummy": 1.0},
+        single_caption_camera_name=None,
+        add_view_prefix_to_caption=False,
+        camera_prefix_mapping=WAYMO_CAPTION_PREFIXES,
+        camera_control_key_mapping={cam: f"world_scenario_{cam}" for cam in WAYMO_CAMERAS},
+    )
+
+    waymo_train_dataset = L(WaymoMultiviewDataset)(
+        dataset_dir="/mnt/sda3/hyh/waymo/posttrain/training",
+        caption_json_path="/mnt/sda3/hyh/waymo/waymo_multiview_texts.json",
+        augmentation_config=waymo_augmentation_config,
+        folder_to_camera_key={
+            "pinhole_front": "pinhole_front",
+            "pinhole_front_left": "pinhole_front_left",
+            "pinhole_front_right": "pinhole_front_right",
+            "pinhole_side_left": "pinhole_side_left",
+            "pinhole_side_right": "pinhole_side_right",
+        },
+        control_dir_name="world_scenario",
+    )
+
+    waymo_val_dataset = L(WaymoMultiviewDataset)(
+        dataset_dir="/mnt/sda3/hyh/waymo/posttrain/validation",
+        caption_json_path="/mnt/sda3/hyh/waymo/waymo_multiview_texts.json",
+        augmentation_config=waymo_augmentation_config,
+        folder_to_camera_key={
+            "pinhole_front": "pinhole_front",
+            "pinhole_front_left": "pinhole_front_left",
+            "pinhole_front_right": "pinhole_front_right",
+            "pinhole_side_left": "pinhole_side_left",
+            "pinhole_side_right": "pinhole_side_right",
+        },
+        control_dir_name="world_scenario",
+    )
+
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="waymo_multiview_train_data",
+        node=L(get_generic_dataloader)(
+            dataset=waymo_train_dataset,
+            sampler=L(get_sampler)(dataset=waymo_train_dataset) if dist.is_initialized() else None,
+            collate_fn=collate_fn,
+            batch_size=1,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+        ),
+    )
+
+    cs.store(
+        group="data_val",
+        package="dataloader_val",
+        name="waymo_multiview_val_data",
+        node=L(get_generic_dataloader)(
+            dataset=waymo_val_dataset,
+            sampler=None,
+            collate_fn=collate_fn,
+            batch_size=1,
+            drop_last=False,
+            num_workers=2,
+            pin_memory=True,
+        ),
+    )
