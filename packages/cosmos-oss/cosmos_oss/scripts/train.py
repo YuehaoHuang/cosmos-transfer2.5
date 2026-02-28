@@ -100,13 +100,9 @@ For python-based LazyConfig, use "path.key=value".
         action="store_true",
         help="Run profiler and save report to output directory.",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-    )
     args = parser.parse_args()
 
-    if args.debug or os.getenv("COSMOS_DEBUG") == "1":
+    if os.getenv("COSMOS_DEBUG") == "1":
         import debugpy
 
         debugpy.listen(5678)

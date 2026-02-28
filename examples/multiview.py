@@ -15,6 +15,7 @@
 
 """Auto multiview model inference script."""
 
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -67,6 +68,14 @@ if __name__ == "__main__":
     except Exception as e:
         handle_tyro_exception(e)
     # pyrefly: ignore  # unbound-name
+    if os.getenv("COSMOS_DEBUG") == "1":
+        import debugpy
+
+        debugpy.listen(5678)
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()
+        print("Attached, continue...")
+
     main(args)
 
     cleanup_environment()
