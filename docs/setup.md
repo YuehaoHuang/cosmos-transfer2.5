@@ -60,6 +60,7 @@ source .venv/bin/activate
 Or, install the package into the active environment (e.g. conda):
 
 ```shell
+export UV_PROJECT_ENVIRONMENT=$CONDA_PREFIX
 uv sync --extra=cu128 --active --inexact
 ```
 
