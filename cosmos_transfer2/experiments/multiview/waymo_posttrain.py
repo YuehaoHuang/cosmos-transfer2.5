@@ -43,6 +43,7 @@ waymo_multiview_post_train = dict(
     model=dict(
         config=dict(
             base_load_from=None,
+            train_sample_views_range=[5, 5],
         ),
     ),
     trainer=dict(
