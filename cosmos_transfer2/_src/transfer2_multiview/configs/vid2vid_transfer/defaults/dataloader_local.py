@@ -262,6 +262,7 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
 
         video_files = sorted(reference_dir.glob("*.mp4"))
         unique_names = [f.stem for f in video_files]
+        self.sample_names = unique_names
 
         print(f"Found {len(unique_names)} video samples in {reference_dir}")
 
@@ -298,53 +299,65 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
         self.augmentations, self.dataset_keys = make_augmentations(augmentation_config)
 
     def __getitem__(self, index: int) -> dict:
-        data_dict = {
-            "__key__": str(index),
-            "__url__": "waymo_local_dataset",
-        }
+        max_retries = 10
+        num_samples = len(self.video_file_dicts)
 
-        for view_key, filepath in self.video_file_dicts[index].items():
-            if filepath is None:
-                raise ValueError(f"view_key {view_key} has null filepath!")
-            video_key = self.augmentation_config.camera_video_key_mapping[view_key]
-            with open(filepath, "rb") as f:
-                data_dict[video_key] = f.read()
-
-        if self.control_file_dicts is not None:
-            for view_key, filepath in self.control_file_dicts[index].items():
-                if filepath is None:
-                    raise ValueError(f"view_key {view_key} has null filepath!")
-                control_key = self.augmentation_config.camera_control_key_mapping[view_key]
-                with open(filepath, "rb") as f:
-                    data_dict[control_key] = f.read()
-
-        # Sample a single random offset shared across ALL cameras to ensure frame alignment.
-        # max_offset = total_video_frames - num_video_frames (190 - 29 = 161)
-        max_offset = max(0, self.total_video_frames - self.augmentation_config.num_video_frames)
-        frame_offset = random.randint(0, max_offset) if max_offset > 0 else 0
-        frame_start = frame_offset
-        frame_end = frame_offset + self.augmentation_config.num_video_frames
-
-        captions_for_sample = self.captions_dict_list[index]
-        for camera_key in self.augmentation_config.camera_keys:
-            caption_text = captions_for_sample.get(camera_key, "A driving scene from an autonomous vehicle.")
-
-            caption_styles = dict(
-                zip(
-                    self.augmentation_config.caption_probability.keys(),
-                    [caption_text for _ in range(len(self.augmentation_config.caption_probability))],
-                )
-            )
-
-            caption_key_name = self.augmentation_config.camera_caption_key_mapping[camera_key]
-            data_dict[caption_key_name] = {
-                "t2w_windows": [{"start_frame": frame_start, "end_frame": frame_end, **caption_styles}]
+        for retry in range(max_retries):
+            sample_index = index if retry == 0 else random.randint(0, num_samples - 1)
+            sample_name = self.sample_names[sample_index]
+            data_dict = {
+                "__key__": sample_name,
+                "__url__": "waymo_local_dataset",
             }
 
-        for k, aug in self.augmentations.items():
-            data_dict = aug(data_dict)
+            for view_key, filepath in self.video_file_dicts[sample_index].items():
+                if filepath is None:
+                    raise ValueError(f"view_key {view_key} has null filepath!")
+                video_key = self.augmentation_config.camera_video_key_mapping[view_key]
+                with open(filepath, "rb") as f:
+                    data_dict[video_key] = f.read()
 
-        return data_dict
+            if self.control_file_dicts is not None:
+                for view_key, filepath in self.control_file_dicts[sample_index].items():
+                    if filepath is None:
+                        raise ValueError(f"view_key {view_key} has null filepath!")
+                    control_key = self.augmentation_config.camera_control_key_mapping[view_key]
+                    with open(filepath, "rb") as f:
+                        data_dict[control_key] = f.read()
+
+            # Sample a single random offset shared across ALL cameras to ensure frame alignment.
+            # max_offset = total_video_frames - num_video_frames (190 - 29 = 161)
+            max_offset = max(0, self.total_video_frames - self.augmentation_config.num_video_frames)
+            frame_offset = random.randint(0, max_offset) if max_offset > 0 else 0
+            frame_start = frame_offset
+            frame_end = frame_offset + self.augmentation_config.num_video_frames
+
+            captions_for_sample = self.captions_dict_list[sample_index]
+            for camera_key in self.augmentation_config.camera_keys:
+                caption_text = captions_for_sample.get(camera_key, "A driving scene from an autonomous vehicle.")
+
+                caption_styles = dict(
+                    zip(
+                        self.augmentation_config.caption_probability.keys(),
+                        [caption_text for _ in range(len(self.augmentation_config.caption_probability))],
+                    )
+                )
+
+                caption_key_name = self.augmentation_config.camera_caption_key_mapping[camera_key]
+                data_dict[caption_key_name] = {
+                    "t2w_windows": [{"start_frame": frame_start, "end_frame": frame_end, **caption_styles}]
+                }
+
+            sample = data_dict
+            for _, aug in self.augmentations.items():
+                sample = aug(sample)
+                if sample is None:
+                    break
+
+            if sample is not None:
+                return sample
+
+        raise RuntimeError(f"Failed to build a valid Waymo sample after {max_retries} retries (start index={index}).")
 
 
 #  NOTE 1: For customized post train: add your dataloader registration here.
@@ -467,8 +480,8 @@ def register_dataloader_local() -> None:
     )
 
     waymo_train_dataset = L(WaymoMultiviewDataset)(
-        dataset_dir="/mnt/sda3/hyh/waymo/posttrain/training",
-        caption_json_path="/mnt/sda3/hyh/waymo/waymo_multiview_texts.json",
+        dataset_dir="/data/waymo/posttrain/training",
+        caption_json_path="/data/waymo/waymo_multiview_texts.json",
         augmentation_config=waymo_augmentation_config,
         folder_to_camera_key={
             "pinhole_front": "pinhole_front",
@@ -481,8 +494,8 @@ def register_dataloader_local() -> None:
     )
 
     waymo_val_dataset = L(WaymoMultiviewDataset)(
-        dataset_dir="/mnt/sda3/hyh/waymo/posttrain/validation",
-        caption_json_path="/mnt/sda3/hyh/waymo/waymo_multiview_texts.json",
+        dataset_dir="/data/waymo/posttrain/validation",
+        caption_json_path="/data/waymo/waymo_multiview_texts.json",
         augmentation_config=waymo_augmentation_config,
         folder_to_camera_key={
             "pinhole_front": "pinhole_front",

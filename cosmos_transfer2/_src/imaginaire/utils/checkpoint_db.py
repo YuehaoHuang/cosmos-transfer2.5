@@ -158,6 +158,8 @@ def _hf_download(cmd_args: list[str]) -> str:
     """
     cmd = [
         "uvx",
+        "--with",
+        "httpx[socks]",
         f"hf>={_MINIMUM_HF_CLI_VERSION}",
         "download",
         *cmd_args,

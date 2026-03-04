@@ -5,14 +5,14 @@
 set -e
 
 # 确保环境变量设置
-export HF_HOME=/mnt/sda3/hyh/huggingface
-export HF_ENDPOINT=https://hf-mirror.com
+# export HF_HOME=/data/huggingface
+# export HF_ENDPOINT=https://hf-mirror.com
 
 echo "=========================================="
 echo "📥 下载 Cosmos-Transfer2.5 全套权重"
 echo "=========================================="
-echo "🗂️  缓存目录: $HF_HOME"
-echo "🌐 镜像站点: $HF_ENDPOINT"
+# echo "🗂️  缓存目录: $HF_HOME"
+# echo "🌐 镜像站点: $HF_ENDPOINT"
 echo ""
 
 # 检查是否在 conda 环境中
