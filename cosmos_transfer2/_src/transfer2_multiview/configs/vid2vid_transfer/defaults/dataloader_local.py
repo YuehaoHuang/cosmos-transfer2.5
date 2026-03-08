@@ -282,7 +282,11 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
                     continue
                 control_files_dict[name][camera_key] = control_file
 
-                caption_key = f"{name[:-2]}_{folder}"
+                base_name = name
+                name_parts = name.rsplit("_", 1)
+                if len(name_parts) == 2 and name_parts[1].isdigit():
+                    base_name = name_parts[0]
+                caption_key = f"{base_name}_{folder}"
                 if caption_key not in self.captions_data:
                     continue
                 captions_dict[name][camera_key] = self.captions_data[caption_key]
@@ -334,7 +338,7 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
 
             captions_for_sample = self.captions_dict_list[sample_index]
             for camera_key in self.augmentation_config.camera_keys:
-                caption_text = captions_for_sample.get(camera_key, "A driving scene from an autonomous vehicle.")
+                caption_text = captions_for_sample.get(camera_key)
 
                 caption_styles = dict(
                     zip(

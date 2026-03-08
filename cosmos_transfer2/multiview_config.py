@@ -111,9 +111,14 @@ class MultiviewInferenceArguments(CommonInferenceArguments):
         default=1, description="Number of overlapping frames between consecutive chunks"
     )
     """Number of overlapping frames between consecutive chunks for temporal consistency."""
+    save_autoregressive_chunks: bool = False
+    """When autoregressive mode is enabled, also save each generated chunk as a separate video file with suffix _<chunk_idx>."""
 
     save_combined_views: bool = True
     """Save a single concatenated video containing all views side-by-side. If False, saves individual split views and a grid view."""
+
+    save_views_in_subfolders: bool = False
+    """When save_combined_views is False, save each view under output_dir/<view_name>/<sample_name>.mp4 instead of a flat file list."""
 
     @pydantic.model_validator(mode="after")
     def validate_input_paths(self):

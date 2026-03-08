@@ -165,8 +165,19 @@ def _hf_download(cmd_args: list[str]) -> str:
         *cmd_args,
     ]
     log.info(f"{shlex.join(cmd)}")
-    subprocess.check_call(cmd, text=True)
-    return subprocess.check_output([*cmd, "--quiet"], text=True, env=dict(os.environ) | {"HF_HUB_OFFLINE": "1"}).strip()
+    env = dict(os.environ)
+    # Respect caller-provided offline mode and make it effective for the whole command.
+    if env.get("HF_HUB_OFFLINE") == "1":
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        env.setdefault("HF_DATASETS_OFFLINE", "1")
+        env.setdefault("UV_OFFLINE", "1")
+
+    # Run only once (quiet mode prints the resolved local path to stdout).
+    result = subprocess.run([*cmd, "--quiet"], text=True, env=env, capture_output=True, check=True)
+    path = result.stdout.strip()
+    if not path:
+        raise RuntimeError(f"Failed to resolve HF download path for command: {shlex.join(cmd)}")
+    return path
 
 
 class _CheckpointHf(_CheckpointUri, ABC):

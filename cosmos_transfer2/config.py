@@ -318,8 +318,8 @@ class CommonInferenceArguments(pydantic.BaseModel):
     """Name of the sample."""
     prompt_path: ResolvedFilePath | None = pydantic.Field(None, init_var=True)
     """Path to a .txt file containing the prompt. Only one of {prompt} or {prompt_path} should be provided."""
-    prompt: str | None = None
-    """Text prompt for generation. Only one of {prompt} or {prompt_path} should be provided."""
+    prompt: str | dict[str, str] | None = None
+    """Text prompt for generation. Can be a string or a per-view mapping. Only one of {prompt} or {prompt_path} should be provided."""
 
     # Optional parameters
     negative_prompt: str | None = None
@@ -339,7 +339,7 @@ class CommonInferenceArguments(pydantic.BaseModel):
         """
         if not isinstance(data, dict):
             return data
-        prompt: str | None = data.get("prompt")
+        prompt: str | dict[str, str] | None = data.get("prompt")
         if prompt is not None:
             return data
         prompt_path: str | None = data.get("prompt_path")

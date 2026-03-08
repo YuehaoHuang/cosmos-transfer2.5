@@ -205,13 +205,17 @@ class ControlVideo2WorldInference:
         seed: int,
         num_steps: int,
         use_negative_prompt: bool,
+        return_latent: bool = False,
     ):
         """Generate video tensor from batch.
 
         Returns:
-            tensor of shape (1, 3, v * t, h, w)
-            where t is the number of frames, v is the number of views, h is the height, and w is the width
-            The values are in the range [0, 1]
+            If return_latent is False:
+                tensor of shape (1, 3, v * t, h, w)
+                where t is the number of frames, v is the number of views, h is the height, and w is the width.
+                The values are in the range [0, 1].
+            If return_latent is True:
+                tuple(decoded_video, latent_sample) where latent_sample is the raw diffusion output before decode.
         """
         data_batch = to_model_input(data_batch, self.model)
         if self.model.config.text_encoder_config is not None and self.model.config.text_encoder_config.compute_online:
@@ -230,8 +234,11 @@ class ControlVideo2WorldInference:
             num_steps=num_steps,
             is_negative_prompt=use_negative_prompt,
         )
-        # (bsz = 1, c = 3, t = n_camera * t, h, w)
-        return ((self.model.decode(sample) + 1.0) / 2.0).clamp(0, 1)
+        decoded = ((self.model.decode(sample) + 1.0) / 2.0).clamp(0, 1)
+        # `sample` is the diffusion-model output before VAE decode.
+        if return_latent:
+            return decoded, sample
+        return decoded
 
     def generate_autoregressive_from_batch(
         self,
@@ -245,7 +252,8 @@ class ControlVideo2WorldInference:
         num_steps: int,
         use_negative_prompt: bool,
         hint_keys: str = "hdmap_bbox",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_chunks: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         """
         Generate video using autoregressive sliding window approach.
 
@@ -282,6 +290,8 @@ class ControlVideo2WorldInference:
 
         # Initialize output video list
         generated_chunks = []
+        raw_generated_chunks = []
+        raw_generated_latent_chunks = []
 
         # Calculate number of chunks needed
         effective_chunk_size = chunk_size - overlap
@@ -315,14 +325,20 @@ class ControlVideo2WorldInference:
             )
 
             # Generate chunk
-            chunk_video = self.generate_from_batch(
+            decoded_chunk, latent_chunk = self.generate_from_batch(
                 chunk_batch,
                 guidance=guidance,
                 seed=int(seed) + chunk_idx,
                 num_steps=num_steps,
                 use_negative_prompt=use_negative_prompt,
-            )[0]  # C_T_H_W
+                return_latent=True,
+            )
+            chunk_video = decoded_chunk[0]  # C_T_H_W
             chunk_video = einops.rearrange(chunk_video, "C (V T) H W -> V C T H W", V=n_views)
+            # Keep latent chunk in raw model layout (C, V*T_latent, H, W) for direct serialization.
+            chunk_latent = latent_chunk[0]
+            raw_generated_chunks.append(chunk_video.clone())
+            raw_generated_latent_chunks.append(chunk_latent.clone())
             # Store generated chunk (remove overlap from previous chunks)
             if chunk_idx == 0:
                 generated_chunks.append(chunk_video)
@@ -359,8 +375,12 @@ class ControlVideo2WorldInference:
             :, :, : final_video.shape[2]
         ]
 
+        chunk_videos = [einops.rearrange(chunk, "V C T H W -> C (V T) H W").cpu() for chunk in raw_generated_chunks]
+        chunk_latents = [chunk.cpu() for chunk in raw_generated_latent_chunks]
         final_video = einops.rearrange(final_video, "V C T H W -> C (V T) H W")
         final_control = einops.rearrange(final_control, "V C T H W -> C (V T) H W")
+        if return_chunks:
+            return final_video.cpu(), final_control.cpu(), chunk_videos, chunk_latents
         return final_video.cpu(), final_control.cpu()
 
     def _create_chunk_batch(

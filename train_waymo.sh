@@ -1,119 +1,210 @@
 #!/bin/bash
-# Waymo 多视角后训练脚本
-# 使用方法: ./train_waymo.sh [选项]
-# 选项:
-#   --debug     启用调试模式 (等待 debugger 连接到端口 5678)
-#   --dryrun    空运行模式 (只打印配置，不实际训练)
-#   --profile   启用性能分析
-#   --gpus N    使用 N 个 GPU (默认: 8)
 
-set -e  # 遇到错误立即退出
+set -e
 
-# ==================== 配置参数 ====================
-# GPU 数量
+# ==================== Configuration Parameters ====================
 NUM_GPUS=${NUM_GPUS:-8}
-
-# 训练配置
+WANDB_MODE=${WANDB_MODE:-offline}
 CONFIG_FILE="cosmos_transfer2/_src/transfer2_multiview/configs/vid2vid_transfer/config.py"
 EXPERIMENT="waymo_multiview_post_train"
-
-# 端口号（用于分布式训练）
-MASTER_PORT=${MASTER_PORT:-12341}
-
-# ==================== 解析命令行参数 ====================
+JOB_PROJECT="cosmos_transfer_v2p5"
+JOB_GROUP="waymo_multiview"
+JOB_NAME="waymo_5cam_post_train"
+MASTER_PORT=${MASTER_PORT:-12351}
 DEBUG_MODE=false
 DRYRUN_MODE=false
 PROFILE_MODE=false
+CHECKPOINT_LOAD_PATH=""
+LOAD_TRAINING_STATE=""
+RUN_VALIDATION=""
+
+# ==================== Parse Command Line Arguments ====================
+
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --debug)
             DEBUG_MODE=true
-            echo "🐛 调试模式已启用 (debugpy 将监听端口 5678)"
+            echo "🐛 Debug mode enabled (debugpy will listen on port 5678)"
             shift
             ;;
         --dryrun)
             DRYRUN_MODE=true
-            echo "🏃 空运行模式已启用 (只打印配置)"
+            echo "🏃 Dry-run mode enabled (only prints configuration)"
             shift
             ;;
         --profile)
             PROFILE_MODE=true
-            echo "📊 性能分析已启用"
+            echo "📊 Profiling enabled"
             shift
             ;;
         --gpus)
             NUM_GPUS="$2"
-            echo "🎮 请求使用 $NUM_GPUS 个 GPU"
+            echo "🎮 Requested $NUM_GPUS GPUs"
+            shift 2
+            ;;
+        --wandb-mode)
+            WANDB_MODE="$2"
+            echo "🧪 Set wandb mode to: $WANDB_MODE"
+            shift 2
+            ;;
+        --checkpoint-load-path)
+            CHECKPOINT_LOAD_PATH="$2"
+            echo "🔁 Set checkpoint.load_path: $CHECKPOINT_LOAD_PATH"
+            shift 2
+            ;;
+        --load-training-state)
+            LOAD_TRAINING_STATE="$2"
+            echo "🧠 Set checkpoint.load_training_state: $LOAD_TRAINING_STATE"
+            shift 2
+            ;;
+        --run-validation)
+            RUN_VALIDATION="$2"
+            echo "🧪 Set trainer.run_validation: $RUN_VALIDATION"
             shift 2
             ;;
         *)
-            echo "未知参数: $1"
-            echo "使用方法: $0 [--debug] [--dryrun] [--profile] [--gpus N]"
+            echo "Unknown parameter: $1"
+            echo "Usage: $0 [--debug] [--dryrun] [--profile] [--gpus N] [--wandb-mode MODE] [--checkpoint-load-path PATH] [--load-training-state BOOL] [--run-validation BOOL]"
             exit 1
             ;;
     esac
 done
 
-# 调试模式强制使用单GPU（避免多进程端口冲突）
+# Derive the output root directory from the checkpoint path to avoid creating a new timestamp directory when resuming training.
+derive_output_root_from_checkpoint() {
+    local checkpoint_path="$1"
+    local job_dir=""
+
+    # Supports two formats: .../checkpoints/iter_xxx or .../checkpoints
+    if [[ "$checkpoint_path" == *"/checkpoints/"* ]]; then
+        job_dir="${checkpoint_path%/checkpoints/*}"
+    elif [[ "$checkpoint_path" == *"/checkpoints" ]]; then
+        job_dir="${checkpoint_path%/checkpoints}"
+    else
+        return 1
+    fi
+
+    if [[ -z "$job_dir" ]]; then
+        return 1
+    fi
+
+    # job_dir format: <output_root>/<project>/<group>/<name>
+    local output_root
+    output_root="$(dirname "$(dirname "$(dirname "$job_dir")")")"
+
+    if [[ -z "$output_root" || "$output_root" == "." || "$output_root" == "/" ]]; then
+        return 1
+    fi
+
+    echo "$output_root"
+    return 0
+}
+
+# Output directory strategy:
+# 1) If --checkpoint-load-path is provided, prioritize reusing the historical output root directory (to avoid creating a new timestamp directory).
+# 2) Otherwise, use the current timestamp to create a new directory.
+if [[ -n "$CHECKPOINT_LOAD_PATH" ]]; then
+    DERIVED_OUTPUT_ROOT="$(derive_output_root_from_checkpoint "$CHECKPOINT_LOAD_PATH" || true)"
+    if [[ -n "$DERIVED_OUTPUT_ROOT" ]]; then
+        export IMAGINAIRE_OUTPUT_ROOT="$DERIVED_OUTPUT_ROOT"
+        echo "♻️  Checkpoint resumption detected, reusing output root directory: $IMAGINAIRE_OUTPUT_ROOT"
+    else
+        RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+        export IMAGINAIRE_OUTPUT_ROOT="/data/cosmos-transfer2.5/output/${RUN_TIMESTAMP}"
+        echo "⚠️  Failed to derive output root directory from checkpoint path, falling back to a new directory: $IMAGINAIRE_OUTPUT_ROOT"
+    fi
+else
+    RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    export IMAGINAIRE_OUTPUT_ROOT="/data/cosmos-transfer2.5/output/${RUN_TIMESTAMP}"
+fi
+
+# Validate wandb mode
+if [[ "$WANDB_MODE" != "online" && "$WANDB_MODE" != "offline" && "$WANDB_MODE" != "disabled" ]]; then
+    echo "❌ Error: Invalid wandb mode: $WANDB_MODE"
+    echo "Valid options: online | offline | disabled"
+    exit 1
+fi
+
+# Validate load_training_state (only when explicitly provided by the user)
+if [[ -n "$LOAD_TRAINING_STATE" && "$LOAD_TRAINING_STATE" != "true" && "$LOAD_TRAINING_STATE" != "false" ]]; then
+    echo "❌ Error: Invalid load_training_state: $LOAD_TRAINING_STATE"
+    echo "Valid options: true | false"
+    exit 1
+fi
+
+# Validate run_validation (only when explicitly provided by the user)
+if [[ -n "$RUN_VALIDATION" && "$RUN_VALIDATION" != "true" && "$RUN_VALIDATION" != "false" ]]; then
+    echo "❌ Error: Invalid run_validation: $RUN_VALIDATION"
+    echo "Valid options: true | false"
+    exit 1
+fi
+
+# Force single GPU for debug mode (to avoid multi-process port conflicts)
 if [ "$DEBUG_MODE" = true ]; then
     if [ "$NUM_GPUS" -ne 1 ]; then
-        echo "⚠️  调试模式自动设置为单GPU（原设置: $NUM_GPUS）"
+        echo "⚠️  Debug mode automatically set to single GPU (original setting: $NUM_GPUS)"
         NUM_GPUS=1
     fi
 fi
 
-# ==================== 检查环境 ====================
+# ==================== Check Environment ====================
 echo "========================================"
-echo "🚀 Cosmos-Transfer2.5 训练脚本"
+echo "🚀 Cosmos-Transfer2.5 Training Script"
 echo "========================================"
-echo "📁 配置文件: $CONFIG_FILE"
-echo "🧪 实验名称: $EXPERIMENT"
-echo "🎮 GPU 数量: $NUM_GPUS"
-echo "🔌 主端口: $MASTER_PORT"
+echo "📁 Config file: $CONFIG_FILE"
+echo "🧪 Experiment: $EXPERIMENT"
+echo "🎮 Number of GPUs: $NUM_GPUS"
+echo "🛰️  wandb mode: $WANDB_MODE"
+echo "📤 Output root dir: $IMAGINAIRE_OUTPUT_ROOT"
+echo "🔌 Master port: $MASTER_PORT"
 echo "========================================"
 
-# 检查配置文件是否存在
+# Check if the configuration file exists
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "❌ 错误: 配置文件不存在: $CONFIG_FILE"
+    echo "❌ Error: Configuration file does not exist: $CONFIG_FILE"
     exit 1
 fi
 
-# 检查 Python 环境
-if ! command -v python &> /dev/null; then
-    echo "❌ 错误: 找不到 Python"
-    exit 1
+# Assemble optional overrides (only added when explicitly provided by the user)
+EXTRA_OVERRIDES=()
+if [ -n "$CHECKPOINT_LOAD_PATH" ]; then
+    EXTRA_OVERRIDES+=("checkpoint.load_path=$CHECKPOINT_LOAD_PATH")
+fi
+if [ -n "$LOAD_TRAINING_STATE" ]; then
+    EXTRA_OVERRIDES+=("checkpoint.load_training_state=$LOAD_TRAINING_STATE")
+fi
+if [ -n "$RUN_VALIDATION" ]; then
+    EXTRA_OVERRIDES+=("trainer.run_validation=$RUN_VALIDATION")
 fi
 
-echo "✅ Python 版本: $(python --version)"
-echo ""
-
-# ==================== 启动训练 ====================
-# 根据模式标志构建参数
+# ==================== Start Training ====================
+# Build arguments based on mode flags
 TRAIN_ARGS=""
 [ "$DRYRUN_MODE" = true ] && TRAIN_ARGS="$TRAIN_ARGS --dryrun"
 [ "$PROFILE_MODE" = true ] && TRAIN_ARGS="$TRAIN_ARGS --profile"
 
-# 调试模式通过环境变量控制（避免 argparse 参数顺序问题）
+# Debug mode is controlled via environment variables (to avoid argparse parameter ordering issues)
 if [ "$DEBUG_MODE" = true ]; then
     export COSMOS_DEBUG=1
-    echo "🔍 设置环境变量: COSMOS_DEBUG=1"
+    echo "🔍 Setting environment variable: COSMOS_DEBUG=1"
 fi
 
 if [ "$NUM_GPUS" -eq 1 ]; then
-    # 单 GPU 训练
-    echo "🔧 使用单 GPU 训练..."
-    echo "📝 执行命令: python -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.wandb_mode=disabled"
+    # Single GPU training
+    echo "🔧 Training with a single GPU..."
+    echo "📝 Executing command: python -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.wandb_mode=$WANDB_MODE ${EXTRA_OVERRIDES[*]}"
     python -m scripts.train \
         $TRAIN_ARGS \
         --config="$CONFIG_FILE" \
         -- \
         experiment="$EXPERIMENT" \
-        job.wandb_mode=disabled
+        job.wandb_mode="$WANDB_MODE" \
+        "${EXTRA_OVERRIDES[@]}"
 else
-    # 多 GPU 分布式训练
-    echo "🔧 使用 torchrun 启动分布式训练 ($NUM_GPUS GPUs)..."
-    echo "📝 执行命令: torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.wandb_mode=disabled"
+    # Multi-GPU distributed training
+    echo "🔧 Launching distributed training via torchrun ($NUM_GPUS GPUs)..."
+    echo "📝 Executing command: torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.wandb_mode=$WANDB_MODE ${EXTRA_OVERRIDES[*]}"
     torchrun \
         --nproc_per_node="$NUM_GPUS" \
         --master_port="$MASTER_PORT" \
@@ -122,33 +213,33 @@ else
         --config="$CONFIG_FILE" \
         -- \
         experiment="$EXPERIMENT" \
-        job.wandb_mode=disabled
+        job.wandb_mode="$WANDB_MODE" \
+        "${EXTRA_OVERRIDES[@]}"
 fi
 
-# 清理环境变量
+# Clean up environment variables
 unset COSMOS_DEBUG
 
-# ==================== 训练完成 ====================
+# ==================== Training Completed ====================
 if [ $? -eq 0 ]; then
     echo ""
     echo "========================================"
-    echo "✅ 训练完成！"
+    echo "✅ Training completed!"
     echo "========================================"
     
-    # 如果不是 dryrun，显示检查点位置
     if [ "$DRYRUN_MODE" = false ]; then
-        CHECKPOINT_DIR="${IMAGINAIRE_OUTPUT_ROOT:-/tmp/imaginaire4-output}/cosmos_transfer_v2p5/auto_multiview/2b_cosmos_multiview_post_train_example/checkpoints"
-        echo "📦 检查点保存位置: $CHECKPOINT_DIR"
+        CHECKPOINT_DIR="${IMAGINAIRE_OUTPUT_ROOT:-/tmp/imaginaire4-output}/${JOB_PROJECT}/${JOB_GROUP}/${JOB_NAME}/checkpoints"
+        echo "📦 Checkpoint save location: $CHECKPOINT_DIR"
         
         if [ -d "$CHECKPOINT_DIR" ]; then
-            echo "📂 检查点列表:"
+            echo "📂 Checkpoint list:"
             ls -lh "$CHECKPOINT_DIR" | tail -n 10
         fi
     fi
 else
     echo ""
     echo "========================================"
-    echo "❌ 训练失败，退出码: $?"
+    echo "❌ Training failed with exit code: $?"
     echo "========================================"
     exit 1
 fi

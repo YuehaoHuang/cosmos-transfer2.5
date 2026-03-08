@@ -1,11 +1,4 @@
 #!/bin/bash
-# Assets 多视角推理脚本 (使用默认 example 数据集)
-# 使用方法: ./inference_assets.sh [选项]
-# 选项:
-#   --input PATH     输入 spec JSON 路径 (默认: assets/multiview_example/multiview_spec.json)
-#   --output DIR     输出目录 (默认: outputs/postrained-auto-mv)
-#   --gpus N         使用 N 个 GPU (默认: 8)
-#   --debug          启用调试模式 (等待 debugger 连接到端口 5678)
 
 set -e
 
@@ -36,7 +29,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --debug)
             DEBUG_MODE=true
-            echo "🐛 调试模式已启用 (debugpy 将监听端口 5678)"
             shift
             ;;
         *)
@@ -46,7 +38,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
 
 
 # ==================== 检查参数 ====================
@@ -69,30 +60,16 @@ echo "✅ Python 版本: $(python --version)"
 echo ""
 
 # ==================== 启动推理 ====================
-if [ "$DEBUG_MODE" = true ]; then
-    export COSMOS_DEBUG=1
-    echo "🔍 设置环境变量: COSMOS_DEBUG=1"
-    echo "🔧 调试模式: 使用单 GPU 推理..."
-    CMD="python -m examples.multiview -i $INPUT_FILE -o $OUTPUT_DIR --experiment $EXPERIMENT"
-    echo "📝 执行命令: $CMD"
-    python -m examples.multiview \
-        -i "$INPUT_FILE" \
-        -o "$OUTPUT_DIR" \
-        --experiment "$EXPERIMENT"
-else
-    echo "🔧 使用 torchrun 启动分布式推理 ($NUM_GPUS GPUs)..."
-    CMD="torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m examples.multiview -i $INPUT_FILE -o $OUTPUT_DIR --experiment $EXPERIMENT"
-    echo "📝 执行命令: $CMD"
-    torchrun \
-        --nproc_per_node="$NUM_GPUS" \
-        --master_port="$MASTER_PORT" \
-        -m examples.multiview \
-        -i "$INPUT_FILE" \
-        -o "$OUTPUT_DIR" \
-        --experiment "$EXPERIMENT"
-fi
-
-unset COSMOS_DEBUG
+echo "🔧 使用 torchrun 启动分布式推理 ($NUM_GPUS GPUs)..."
+CMD="torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m examples.multiview -i $INPUT_FILE -o $OUTPUT_DIR --experiment $EXPERIMENT"
+echo "📝 执行命令: $CMD"
+torchrun \
+    --nproc_per_node="$NUM_GPUS" \
+    --master_port="$MASTER_PORT" \
+    -m examples.multiview \
+    -i "$INPUT_FILE" \
+    -o "$OUTPUT_DIR" \
+    --experiment "$EXPERIMENT"
 
 # ==================== 推理完成 ====================
 if [ $? -eq 0 ]; then

@@ -59,6 +59,17 @@ DEFAULT_CAMERA_PREFIX_MAPPING = {
     "front_tele": "The video is captured from a telephoto camera mounted on a car. The camera is facing forward.",
 }
 
+# Waymo 5-view semantic order used by waymo_multiview_post_train training.
+# Keep these indices aligned with dataloader_local.py WAYMO_CAMERA_VIEW_MAPPING.
+WAYMO_ALIGNED_CAMERA_ORDER: tuple[str, ...] = (
+    "front_wide",   # pinhole_front
+    "cross_left",   # pinhole_front_left
+    "cross_right",  # pinhole_front_right
+    "rear_left",    # pinhole_side_left
+    "rear_right",   # pinhole_side_right
+)
+WAYMO_ALIGNED_CAMERA_VIEW_MAPPING = {camera_key: idx for idx, camera_key in enumerate(WAYMO_ALIGNED_CAMERA_ORDER)}
+
 
 def setup_config(
     resolution_hw: tuple[int, int],
@@ -73,7 +84,7 @@ def setup_config(
     invalid_keys = set(camera_keys) - set(DEFAULT_CAMERA_KEYS)
     if invalid_keys:
         raise ValueError(f"Unknown camera keys provided: {', '.join(sorted(invalid_keys))}")
-    if single_caption_camera_name not in camera_keys:
+    if single_caption_camera_name is not None and single_caption_camera_name not in camera_keys:
         single_caption_camera_name = camera_keys[0]
 
     kwargs = dict(
@@ -90,6 +101,15 @@ def setup_config(
         single_caption_camera_name=single_caption_camera_name,
     )
     return AugmentationConfig(**kwargs)
+
+
+def maybe_get_waymo_aligned_camera_keys(camera_keys: tuple[str, ...]) -> tuple[str, ...]:
+    """Return Waymo-aligned camera order when sample matches the 5-view Waymo subset."""
+    camera_set = set(camera_keys)
+    waymo_set = set(WAYMO_ALIGNED_CAMERA_ORDER)
+    if camera_set == waymo_set:
+        return WAYMO_ALIGNED_CAMERA_ORDER
+    return camera_keys
 
 
 class MultiviewInference:
@@ -151,12 +171,14 @@ class MultiviewInference:
 
     def _generate_sample(self, sample: MultiviewInferenceArguments, output_dir: Path) -> str | None:
         log.debug(f"{sample.__class__.__name__}({sample})")
-        output_path = output_dir / sample.name
+        sample_output_dir = output_dir / sample.name if sample.save_views_in_subfolders else output_dir
+        output_path = sample_output_dir / sample.name
 
         if self.rank0:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            open(f"{output_path}.json", "w").write(sample.model_dump_json())
-            log.info(f"Saved arguments to {output_path}.json")
+            sample_output_dir.mkdir(parents=True, exist_ok=True)
+            args_path = sample_output_dir / f"{sample.name}.json"
+            open(args_path, "w").write(sample.model_dump_json())
+            log.info(f"Saved arguments to {args_path}")
 
         # setup the control and input videos dict
         input_video_file_dict = {}
@@ -222,8 +244,15 @@ class MultiviewInference:
         if sample.enable_autoregressive:
             num_video_frames_per_view += (num_video_frames_per_view - sample.chunk_overlap) * (effective_num_chunks - 1)
 
-        camera_keys = sample.active_camera_keys
-        primary_caption_view = "front_wide" if "front_wide" in camera_keys else camera_keys[0]
+        camera_keys = maybe_get_waymo_aligned_camera_keys(sample.active_camera_keys)
+        prompt_is_mapping = isinstance(sample.prompt, dict)
+        primary_caption_view = (
+            None if prompt_is_mapping else ("front_wide" if "front_wide" in camera_keys else camera_keys[0])
+        )
+        camera_view_mapping = {key: DEFAULT_CAMERA_VIEW_MAPPING[key] for key in camera_keys}
+        if camera_keys == WAYMO_ALIGNED_CAMERA_ORDER:
+            # Use Waymo training-time semantic indices (0..4) for the 5-view subset.
+            camera_view_mapping = {key: WAYMO_ALIGNED_CAMERA_VIEW_MAPPING[key] for key in camera_keys}
         augmentation_config = setup_config(
             resolution_hw=RESOLUTIONS[self.pipe.config.model.config.resolution],
             num_video_frames_per_view=num_video_frames_per_view,
@@ -231,6 +260,7 @@ class MultiviewInference:
             camera_keys=camera_keys,
             single_caption_camera_name=primary_caption_view,
         )
+        augmentation_config.camera_view_mapping = camera_view_mapping
         if SMOKE:
             log.warning(f"Reducing the number of views to 1 for smoke test. Generated quality will be sub-optimal.")
             augmentation_config.camera_keys = augmentation_config.camera_keys[:1]
@@ -245,8 +275,14 @@ class MultiviewInference:
             if self.text_guardrail_runner is not None:
                 log.info("Running guardrail check on prompt...")
                 assert sample.prompt is not None
-                if not guardrail_presets.run_text_guardrail(sample.prompt, self.text_guardrail_runner):
-                    message = f"Guardrail blocked generation. Prompt: {sample.prompt}"
+                prompts_to_check = list(sample.prompt.values()) if isinstance(sample.prompt, dict) else [sample.prompt]
+                blocked_prompt = None
+                for prompt in prompts_to_check:
+                    if not guardrail_presets.run_text_guardrail(prompt, self.text_guardrail_runner):
+                        blocked_prompt = prompt
+                        break
+                if blocked_prompt is not None:
+                    message = f"Guardrail blocked generation. Prompt: {blocked_prompt}"
                     log.critical(message)
                     if self.setup_args.keep_going:
                         return None
@@ -295,7 +331,7 @@ class MultiviewInference:
 
             if sample.enable_autoregressive:
                 log.info(f"------ Generating video with autoregressive mode ------")
-                video, control = self.pipe.generate_autoregressive_from_batch(
+                autoregressive_output = self.pipe.generate_autoregressive_from_batch(
                     batch,
                     n_views=len(augmentation_config.camera_keys),
                     chunk_overlap=sample.chunk_overlap,
@@ -305,7 +341,14 @@ class MultiviewInference:
                     num_conditional_frames=num_conditional_frames,
                     num_steps=sample.num_steps,
                     use_negative_prompt=True,
+                    return_chunks=sample.save_autoregressive_chunks,
                 )
+                if sample.save_autoregressive_chunks:
+                    video, control, chunk_videos, chunk_latents = autoregressive_output
+                else:
+                    video, control = autoregressive_output
+                    chunk_videos = []
+                    chunk_latents = []
             else:
                 log.info(f"------ Generating video ------")
                 if isinstance(num_conditional_frames, list):
@@ -393,9 +436,86 @@ class MultiviewInference:
                 # Save individual view videos
                 output_messages = []
                 for view_name, view_tensor in view_tensors:
-                    view_output_path = f"{output_path}_{view_name}"
+                    if sample.save_views_in_subfolders:
+                        view_dir = sample_output_dir / view_name
+                        view_dir.mkdir(parents=True, exist_ok=True)
+                        view_output_path = str(view_dir / sample.name)
+                    else:
+                        view_output_path = f"{output_path}_{view_name}"
                     save_img_or_video(view_tensor, view_output_path, fps=sample.fps, quality=8)
                     output_messages.append(f"{view_output_path}.mp4")
+
+                # Save per-view autoregressive chunks with overlap preserved
+                if sample.enable_autoregressive and sample.save_autoregressive_chunks:
+                    for chunk_idx, chunk_video in enumerate(chunk_videos):
+                        chunk_latent = chunk_latents[chunk_idx] if chunk_idx < len(chunk_latents) else None
+                        chunk_total_frames = chunk_video.shape[1]
+                        if chunk_total_frames % n_views != 0:
+                            raise ValueError(
+                                f"Chunk frames ({chunk_total_frames}) not divisible by number of views ({n_views})."
+                            )
+                        chunk_frames_per_view = chunk_total_frames // n_views
+                        latent_frames_per_view = None
+                        if chunk_latent is not None:
+                            chunk_total_latent_frames = chunk_latent.shape[1]
+                            if chunk_total_latent_frames % n_views != 0:
+                                raise ValueError(
+                                    f"Chunk latent frames ({chunk_total_latent_frames}) not divisible by number of views ({n_views})."
+                                )
+                            latent_frames_per_view = chunk_total_latent_frames // n_views
+
+                        for view_index, view_name in enumerate(camera_keys):
+                            start = view_index * chunk_frames_per_view
+                            end = start + chunk_frames_per_view
+                            view_chunk = chunk_video[:, start:end]
+                            if sample.save_views_in_subfolders:
+                                view_dir = sample_output_dir / view_name
+                                view_dir.mkdir(parents=True, exist_ok=True)
+                                chunk_output_path = str(view_dir / f"chunk_{chunk_idx}")
+                            else:
+                                chunk_output_path = f"{output_path}_{view_name}_chunk_{chunk_idx}"
+                            save_img_or_video(view_chunk, chunk_output_path, fps=sample.fps, quality=8)
+                            output_messages.append(f"{chunk_output_path}.mp4")
+
+                            if chunk_latent is not None and latent_frames_per_view is not None:
+                                latent_start = view_index * latent_frames_per_view
+                                latent_end = latent_start + latent_frames_per_view
+                                view_chunk_latent = chunk_latent[:, latent_start:latent_end].cpu()
+                                if sample.save_views_in_subfolders:
+                                    view_dir = sample_output_dir / view_name
+                                    view_dir.mkdir(parents=True, exist_ok=True)
+                                    latent_output_path = view_dir / f"sample_{chunk_idx}.pt"
+                                else:
+                                    latent_output_path = Path(f"{output_path}_{view_name}_sample_{chunk_idx}.pt")
+                                torch.save(view_chunk_latent, latent_output_path)
+                                output_messages.append(str(latent_output_path))
+
+                        # Save grid video for this chunk.
+                        grid_rows, grid_cols = 3, 3
+                        c = chunk_video.shape[0]
+                        t = chunk_frames_per_view
+                        h = chunk_video.shape[2]
+                        w = chunk_video.shape[3]
+                        chunk_grid_tensor = torch.zeros(
+                            (c, t, grid_rows * h, grid_cols * w), dtype=chunk_video.dtype, device=chunk_video.device
+                        )
+
+                        num_views_in_chunk_grid = min(n_views, grid_rows * grid_cols)
+                        for idx in range(num_views_in_chunk_grid):
+                            row, col = idx // grid_cols, idx % grid_cols
+                            start = idx * chunk_frames_per_view
+                            end = start + chunk_frames_per_view
+                            view_chunk = chunk_video[:, start:end]
+                            chunk_grid_tensor[:, :, row * h : (row + 1) * h, col * w : (col + 1) * w] = view_chunk
+
+                        if sample.save_views_in_subfolders:
+                            grid_dir = sample_output_dir / "grid"
+                            grid_dir.mkdir(parents=True, exist_ok=True)
+                            chunk_grid_output_path = str(grid_dir / f"chunk_{chunk_idx}")
+                        else:
+                            chunk_grid_output_path = f"{output_path}_grid_chunk_{chunk_idx}"
+                        save_img_or_video(chunk_grid_tensor, chunk_grid_output_path, fps=sample.fps, quality=8)
+                        output_messages.append(f"{chunk_grid_output_path}.mp4")
 
                 # Save grid video
                 grid_rows, grid_cols = 3, 3
@@ -407,7 +527,12 @@ class MultiviewInference:
                     row, col = idx // grid_cols, idx % grid_cols
                     grid_tensor[:, :, row * h : (row + 1) * h, col * w : (col + 1) * w] = view_tensors[idx][1]
 
-                grid_output_path = f"{output_path}_grid"
+                if sample.save_views_in_subfolders:
+                    grid_dir = sample_output_dir / "grid"
+                    grid_dir.mkdir(parents=True, exist_ok=True)
+                    grid_output_path = str(grid_dir / f"{sample.name}_grid")
+                else:
+                    grid_output_path = f"{output_path}_grid"
                 save_img_or_video(grid_tensor, grid_output_path, fps=sample.fps, quality=8)
                 output_messages.append(
                     f"{grid_output_path}.mp4 ({num_views_in_grid} views in {grid_rows}x{grid_cols} grid)"

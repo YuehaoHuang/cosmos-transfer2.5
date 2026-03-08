@@ -96,7 +96,7 @@ class LocalMultiViewDataset(Dataset):
     def __init__(
         self,
         video_file_dicts: list[dict[str, bytes | Path | None]],
-        prompts: list[str],
+        prompts: list[str | dict[str, str]],
         augmentation_config: AugmentationConfig,
         camera_key_adapter: dict[str, str] | None = None,
         control_file_dicts: list[dict[str, bytes | Path | None]] | None = None,
@@ -113,10 +113,15 @@ class LocalMultiViewDataset(Dataset):
         if len(self.prompts) != len(self.video_file_dicts):
             raise ValueError("Number of prompts and video file dicts must be the same!")
 
-        if self.augmentation_config.single_caption_camera_name is None:
-            raise ValueError(
-                "`single_caption_camera_name` must be set since only single prompt is provided by dataset!"
-            )
+        self.per_view_prompts = any(isinstance(prompt, dict) for prompt in self.prompts)
+        if self.per_view_prompts:
+            if self.augmentation_config.single_caption_camera_name is not None:
+                raise ValueError("`single_caption_camera_name` must be None when per-view prompts are provided.")
+        else:
+            if self.augmentation_config.single_caption_camera_name is None:
+                raise ValueError(
+                    "`single_caption_camera_name` must be set since only single prompt is provided by dataset!"
+                )
 
         self.augmentations, self.dataset_keys = make_augmentations(augmentation_config)
 
@@ -152,21 +157,39 @@ class LocalMultiViewDataset(Dataset):
                     with open(filepath, "rb") as f:
                         data_dict[control_key] = f.read()
 
-        caption_styles = dict(
-            zip(
-                self.augmentation_config.caption_probability.keys(),
-                [self.prompts[index] for _ in range(len(self.augmentation_config.caption_probability))],
+        if self.per_view_prompts:
+            prompt_map = self.prompts[index]
+            assert isinstance(prompt_map, dict)
+            fallback_prompt = next(iter(prompt_map.values()), "")
+            for camera_key, caption_key in self.augmentation_config.camera_caption_key_mapping.items():
+                prompt = prompt_map.get(camera_key, fallback_prompt)
+                caption_styles = dict(
+                    zip(
+                        self.augmentation_config.caption_probability.keys(),
+                        [prompt for _ in range(len(self.augmentation_config.caption_probability))],
+                    )
+                )
+                data_dict[caption_key] = {
+                    "t2w_windows": [
+                        {"start_frame": 0, "end_frame": self.augmentation_config.num_video_frames, **caption_styles}
+                    ]
+                }
+        else:
+            caption_styles = dict(
+                zip(
+                    self.augmentation_config.caption_probability.keys(),
+                    [self.prompts[index] for _ in range(len(self.augmentation_config.caption_probability))],
+                )
             )
-        )
 
-        caption_key = self.augmentation_config.camera_caption_key_mapping[
-            self.augmentation_config.single_caption_camera_name
-        ]
-        data_dict[caption_key] = {
-            "t2w_windows": [
-                {"start_frame": 0, "end_frame": self.augmentation_config.num_video_frames, **caption_styles}
+            caption_key = self.augmentation_config.camera_caption_key_mapping[
+                self.augmentation_config.single_caption_camera_name
             ]
-        }
+            data_dict[caption_key] = {
+                "t2w_windows": [
+                    {"start_frame": 0, "end_frame": self.augmentation_config.num_video_frames, **caption_styles}
+                ]
+            }
 
         for k, aug in self.augmentations.items():
             data_dict = aug(data_dict)
