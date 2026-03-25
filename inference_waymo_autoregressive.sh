@@ -6,7 +6,7 @@ set -e
 NUM_GPUS=${NUM_GPUS:-8}
 MASTER_PORT=${MASTER_PORT:-12341}
 EXPERIMENT="waymo_multiview_post_train"
-CHECKPOINT_PATH="/data/cosmos-transfer2.5/output/20260304_220742/cosmos_transfer_v2p5/waymo_multiview/waymo_5cam_post_train/checkpoints/iter_000004400/model_ema_bf16.pt"
+CHECKPOINT_PATH="/data/cosmos-transfer2.5/output/20260313_225508/cosmos_transfer_v2p5/waymo_multiview/waymo_5cam_post_train/checkpoints/iter_000011000/model_ema_bf16.pt"
 INPUT_FILE="${WAYMO_INPUT_FILE:-}"
 OUTPUT_DIR="outputs/waymo-autoregressive-mv"
 WAYMO_SPLIT="training"

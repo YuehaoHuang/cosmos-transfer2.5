@@ -297,7 +297,7 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
 
         # Total frames per video clip (used for random window sampling in __getitem__).
         # Adjust this if your videos have a different length.
-        self.total_video_frames = 190
+        self.total_video_frames = 29
 
         torch.utils.data.Dataset.__init__(self)
         self.augmentations, self.dataset_keys = make_augmentations(augmentation_config)
@@ -484,7 +484,7 @@ def register_dataloader_local() -> None:
     )
 
     waymo_train_dataset = L(WaymoMultiviewDataset)(
-        dataset_dir="/data/waymo/posttrain/training",
+        dataset_dir="/data/waymo/chunk/training",
         caption_json_path="/data/waymo/waymo_multiview_texts.json",
         augmentation_config=waymo_augmentation_config,
         folder_to_camera_key={
@@ -498,7 +498,7 @@ def register_dataloader_local() -> None:
     )
 
     waymo_val_dataset = L(WaymoMultiviewDataset)(
-        dataset_dir="/data/waymo/posttrain/validation",
+        dataset_dir="/data/waymo/chunk/validation",
         caption_json_path="/data/waymo/waymo_multiview_texts.json",
         augmentation_config=waymo_augmentation_config,
         folder_to_camera_key={

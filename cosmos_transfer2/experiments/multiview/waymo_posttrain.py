@@ -28,7 +28,7 @@ waymo_multiview_post_train = dict(
     ],
     job=dict(project="cosmos_transfer_v2p5", group="waymo_multiview", name="waymo_5cam_post_train"),
     checkpoint=dict(
-        save_iter=200,
+        save_iter=1000,
         # pyrefly: ignore  # missing-attribute
         load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
         load_training_state=False,
@@ -48,26 +48,26 @@ waymo_multiview_post_train = dict(
     ),
     trainer=dict(
         logging_iter=50,
-        max_iter=10_000,
-        validation_iter=500,
-        run_validation=True,
+        max_iter=100_000,
+        validation_iter=1000,
+        run_validation=False,
         callbacks=dict(
             heart_beat=dict(
                 save_s3=False,
             ),
             iter_speed=dict(
-                hit_thres=200,
+                hit_thres=1000,
                 save_s3=False,
             ),
             device_monitor=dict(
                 save_s3=False,
             ),
             every_n_sample_reg=dict(
-                every_n=200,
+                every_n=1000,
                 save_s3=False,
             ),
             every_n_sample_ema=dict(
-                every_n=200,
+                every_n=1000,
                 save_s3=False,
             ),
             wandb=dict(

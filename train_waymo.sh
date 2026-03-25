@@ -15,8 +15,9 @@ DEBUG_MODE=false
 DRYRUN_MODE=false
 PROFILE_MODE=false
 CHECKPOINT_LOAD_PATH=""
-LOAD_TRAINING_STATE=""
+LOAD_TRAINING_STATE="false"
 RUN_VALIDATION=""
+JOB_NAME_EFFECTIVE="$JOB_NAME"
 
 # ==================== Parse Command Line Arguments ====================
 
@@ -101,22 +102,56 @@ derive_output_root_from_checkpoint() {
     return 0
 }
 
+# Derive job name from checkpoint path: <output_root>/<project>/<group>/<name>/checkpoints[/iter_xxx]
+derive_job_name_from_checkpoint() {
+    local checkpoint_path="$1"
+    local job_dir=""
+
+    if [[ "$checkpoint_path" == *"/checkpoints/"* ]]; then
+        job_dir="${checkpoint_path%/checkpoints/*}"
+    elif [[ "$checkpoint_path" == *"/checkpoints" ]]; then
+        job_dir="${checkpoint_path%/checkpoints}"
+    else
+        return 1
+    fi
+
+    if [[ -z "$job_dir" ]]; then
+        return 1
+    fi
+
+    basename "$job_dir"
+    return 0
+}
+
 # Output directory strategy:
-# 1) If --checkpoint-load-path is provided, prioritize reusing the historical output root directory (to avoid creating a new timestamp directory).
-# 2) Otherwise, use the current timestamp to create a new directory.
-if [[ -n "$CHECKPOINT_LOAD_PATH" ]]; then
+# 1) If --checkpoint-load-path is provided AND --load-training-state=true, reuse historical output root directory.
+# 2) Otherwise, create a new timestamped output root directory.
+RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+if [[ -n "$CHECKPOINT_LOAD_PATH" && "$LOAD_TRAINING_STATE" == "true" ]]; then
     DERIVED_OUTPUT_ROOT="$(derive_output_root_from_checkpoint "$CHECKPOINT_LOAD_PATH" || true)"
+    DERIVED_JOB_NAME="$(derive_job_name_from_checkpoint "$CHECKPOINT_LOAD_PATH" || true)"
     if [[ -n "$DERIVED_OUTPUT_ROOT" ]]; then
         export IMAGINAIRE_OUTPUT_ROOT="$DERIVED_OUTPUT_ROOT"
         echo "♻️  Checkpoint resumption detected, reusing output root directory: $IMAGINAIRE_OUTPUT_ROOT"
     else
-        RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
         export IMAGINAIRE_OUTPUT_ROOT="/data/cosmos-transfer2.5/output/${RUN_TIMESTAMP}"
         echo "⚠️  Failed to derive output root directory from checkpoint path, falling back to a new directory: $IMAGINAIRE_OUTPUT_ROOT"
     fi
+
+    if [[ -n "$DERIVED_JOB_NAME" ]]; then
+        JOB_NAME_EFFECTIVE="$DERIVED_JOB_NAME"
+        echo "♻️  Checkpoint resumption detected, reusing job name from checkpoint path: $JOB_NAME_EFFECTIVE"
+    else
+        echo "⚠️  Failed to derive job name from checkpoint path, keeping configured job name: $JOB_NAME_EFFECTIVE"
+    fi
 else
-    RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
     export IMAGINAIRE_OUTPUT_ROOT="/data/cosmos-transfer2.5/output/${RUN_TIMESTAMP}"
+fi
+
+# Non-resume runs should keep a stable job name and use timestamped output root for uniqueness.
+if [[ -z "$CHECKPOINT_LOAD_PATH" || "$LOAD_TRAINING_STATE" != "true" ]]; then
+    JOB_NAME_EFFECTIVE="$JOB_NAME"
+    echo "🆕 Non-resume run: creating a new run directory under timestamped output root with stable job name: $JOB_NAME_EFFECTIVE"
 fi
 
 # Validate wandb mode
@@ -126,8 +161,8 @@ if [[ "$WANDB_MODE" != "online" && "$WANDB_MODE" != "offline" && "$WANDB_MODE" !
     exit 1
 fi
 
-# Validate load_training_state (only when explicitly provided by the user)
-if [[ -n "$LOAD_TRAINING_STATE" && "$LOAD_TRAINING_STATE" != "true" && "$LOAD_TRAINING_STATE" != "false" ]]; then
+# Validate load_training_state
+if [[ "$LOAD_TRAINING_STATE" != "true" && "$LOAD_TRAINING_STATE" != "false" ]]; then
     echo "❌ Error: Invalid load_training_state: $LOAD_TRAINING_STATE"
     echo "Valid options: true | false"
     exit 1
@@ -154,6 +189,7 @@ echo "🚀 Cosmos-Transfer2.5 Training Script"
 echo "========================================"
 echo "📁 Config file: $CONFIG_FILE"
 echo "🧪 Experiment: $EXPERIMENT"
+echo "🏷️  Job name: $JOB_NAME_EFFECTIVE"
 echo "🎮 Number of GPUs: $NUM_GPUS"
 echo "🛰️  wandb mode: $WANDB_MODE"
 echo "📤 Output root dir: $IMAGINAIRE_OUTPUT_ROOT"
@@ -171,9 +207,7 @@ EXTRA_OVERRIDES=()
 if [ -n "$CHECKPOINT_LOAD_PATH" ]; then
     EXTRA_OVERRIDES+=("checkpoint.load_path=$CHECKPOINT_LOAD_PATH")
 fi
-if [ -n "$LOAD_TRAINING_STATE" ]; then
-    EXTRA_OVERRIDES+=("checkpoint.load_training_state=$LOAD_TRAINING_STATE")
-fi
+EXTRA_OVERRIDES+=("checkpoint.load_training_state=$LOAD_TRAINING_STATE")
 if [ -n "$RUN_VALIDATION" ]; then
     EXTRA_OVERRIDES+=("trainer.run_validation=$RUN_VALIDATION")
 fi
@@ -193,18 +227,19 @@ fi
 if [ "$NUM_GPUS" -eq 1 ]; then
     # Single GPU training
     echo "🔧 Training with a single GPU..."
-    echo "📝 Executing command: python -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.wandb_mode=$WANDB_MODE ${EXTRA_OVERRIDES[*]}"
+    echo "📝 Executing command: python -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.name=\"$JOB_NAME_EFFECTIVE\" job.wandb_mode=$WANDB_MODE ${EXTRA_OVERRIDES[*]}"
     python -m scripts.train \
         $TRAIN_ARGS \
         --config="$CONFIG_FILE" \
         -- \
         experiment="$EXPERIMENT" \
+        job.name="$JOB_NAME_EFFECTIVE" \
         job.wandb_mode="$WANDB_MODE" \
         "${EXTRA_OVERRIDES[@]}"
 else
     # Multi-GPU distributed training
     echo "🔧 Launching distributed training via torchrun ($NUM_GPUS GPUs)..."
-    echo "📝 Executing command: torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.wandb_mode=$WANDB_MODE ${EXTRA_OVERRIDES[*]}"
+    echo "📝 Executing command: torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m scripts.train$TRAIN_ARGS --config=\"$CONFIG_FILE\" -- experiment=\"$EXPERIMENT\" job.name=\"$JOB_NAME_EFFECTIVE\" job.wandb_mode=$WANDB_MODE ${EXTRA_OVERRIDES[*]}"
     torchrun \
         --nproc_per_node="$NUM_GPUS" \
         --master_port="$MASTER_PORT" \
@@ -213,6 +248,7 @@ else
         --config="$CONFIG_FILE" \
         -- \
         experiment="$EXPERIMENT" \
+        job.name="$JOB_NAME_EFFECTIVE" \
         job.wandb_mode="$WANDB_MODE" \
         "${EXTRA_OVERRIDES[@]}"
 fi
@@ -228,7 +264,7 @@ if [ $? -eq 0 ]; then
     echo "========================================"
     
     if [ "$DRYRUN_MODE" = false ]; then
-        CHECKPOINT_DIR="${IMAGINAIRE_OUTPUT_ROOT:-/tmp/imaginaire4-output}/${JOB_PROJECT}/${JOB_GROUP}/${JOB_NAME}/checkpoints"
+        CHECKPOINT_DIR="${IMAGINAIRE_OUTPUT_ROOT:-/tmp/imaginaire4-output}/${JOB_PROJECT}/${JOB_GROUP}/${JOB_NAME_EFFECTIVE}/checkpoints"
         echo "📦 Checkpoint save location: $CHECKPOINT_DIR"
         
         if [ -d "$CHECKPOINT_DIR" ]; then

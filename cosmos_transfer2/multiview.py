@@ -62,11 +62,11 @@ DEFAULT_CAMERA_PREFIX_MAPPING = {
 # Waymo 5-view semantic order used by waymo_multiview_post_train training.
 # Keep these indices aligned with dataloader_local.py WAYMO_CAMERA_VIEW_MAPPING.
 WAYMO_ALIGNED_CAMERA_ORDER: tuple[str, ...] = (
-    "front_wide",   # pinhole_front
-    "cross_left",   # pinhole_front_left
+    "front_wide",  # pinhole_front
+    "cross_left",  # pinhole_front_left
     "cross_right",  # pinhole_front_right
-    "rear_left",    # pinhole_side_left
-    "rear_right",   # pinhole_side_right
+    "rear_left",  # pinhole_side_left
+    "rear_right",  # pinhole_side_right
 )
 WAYMO_ALIGNED_CAMERA_VIEW_MAPPING = {camera_key: idx for idx, camera_key in enumerate(WAYMO_ALIGNED_CAMERA_ORDER)}
 
@@ -455,14 +455,12 @@ class MultiviewInference:
                                 f"Chunk frames ({chunk_total_frames}) not divisible by number of views ({n_views})."
                             )
                         chunk_frames_per_view = chunk_total_frames // n_views
-                        latent_frames_per_view = None
                         if chunk_latent is not None:
                             chunk_total_latent_frames = chunk_latent.shape[1]
                             if chunk_total_latent_frames % n_views != 0:
                                 raise ValueError(
                                     f"Chunk latent frames ({chunk_total_latent_frames}) not divisible by number of views ({n_views})."
                                 )
-                            latent_frames_per_view = chunk_total_latent_frames // n_views
 
                         for view_index, view_name in enumerate(camera_keys):
                             start = view_index * chunk_frames_per_view
@@ -477,18 +475,17 @@ class MultiviewInference:
                             save_img_or_video(view_chunk, chunk_output_path, fps=sample.fps, quality=8)
                             output_messages.append(f"{chunk_output_path}.mp4")
 
-                            if chunk_latent is not None and latent_frames_per_view is not None:
-                                latent_start = view_index * latent_frames_per_view
-                                latent_end = latent_start + latent_frames_per_view
-                                view_chunk_latent = chunk_latent[:, latent_start:latent_end].cpu()
-                                if sample.save_views_in_subfolders:
-                                    view_dir = sample_output_dir / view_name
-                                    view_dir.mkdir(parents=True, exist_ok=True)
-                                    latent_output_path = view_dir / f"sample_{chunk_idx}.pt"
-                                else:
-                                    latent_output_path = Path(f"{output_path}_{view_name}_sample_{chunk_idx}.pt")
-                                torch.save(view_chunk_latent, latent_output_path)
-                                output_messages.append(str(latent_output_path))
+                        if chunk_latent is not None:
+                            samples_dir = sample_output_dir / "samples"
+                            samples_dir.mkdir(parents=True, exist_ok=True)
+                            latent_filename = (
+                                f"sample_{chunk_idx}.pt"
+                                if sample.save_views_in_subfolders
+                                else f"{sample.name}_sample_{chunk_idx}.pt"
+                            )
+                            latent_output_path = samples_dir / latent_filename
+                            torch.save(chunk_latent.contiguous().to(torch.bfloat16).cpu(), latent_output_path)
+                            output_messages.append(str(latent_output_path))
 
                         # Save grid video for this chunk.
                         grid_rows, grid_cols = 3, 3
