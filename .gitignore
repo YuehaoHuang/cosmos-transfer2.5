@@ -1,5 +1,7 @@
 .vscode
 assets/multiview_example1
+data2
+.codex
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -208,3 +210,5 @@ cython_debug/
 !assets/**/*.png
 !assets/**/*.jpg
 !assets/**/*.mp4
+
+third_party_ref_repo

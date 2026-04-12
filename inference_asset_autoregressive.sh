@@ -73,6 +73,13 @@ if [ "$OFFLINE_MODE" = true ]; then
     export UV_OFFLINE=1
     export UV_NO_PROGRESS=1
     echo "📦 Setting offline cache environment variables: HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 UV_OFFLINE=1 UV_NO_PROGRESS=1"
+
+    # Prefer shared HF cache when available (commonly pre-populated on training/inference servers).
+    if [ -d "/data/huggingface/hub" ]; then
+        export HF_HOME="${HF_HOME:-/data/huggingface}"
+        export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+        echo "📦 Using HuggingFace cache: HF_HOME=$HF_HOME HF_HUB_CACHE=$HF_HUB_CACHE"
+    fi
 fi
 
 # ==================== Start Inference ====================

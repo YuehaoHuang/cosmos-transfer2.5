@@ -17,7 +17,6 @@ import os
 
 from hydra.core.config_store import ConfigStore
 
-from cosmos_transfer2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 from cosmos_transfer2.multiview_config import DEFAULT_CHECKPOINT
 
 waymo_multiview_post_train = dict(
@@ -30,7 +29,7 @@ waymo_multiview_post_train = dict(
     checkpoint=dict(
         save_iter=1000,
         # pyrefly: ignore  # missing-attribute
-        load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
+        load_path=DEFAULT_CHECKPOINT.s3.uri,
         load_training_state=False,
         strict_resume=False,
         load_from_object_store=dict(

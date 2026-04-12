@@ -63,6 +63,7 @@ load_checkpoint(checkpoint_uri)
 
 import functools
 import os
+import shutil
 import shlex
 import subprocess
 import uuid
@@ -156,7 +157,7 @@ def _hf_download(cmd_args: list[str]) -> str:
     Uses a newer Hugging Face CLI version to download checkpoint. The dependency
     version is very old and not robust.
     """
-    cmd = [
+    uvx_cmd = [
         "uvx",
         "--with",
         "httpx[socks]",
@@ -164,7 +165,6 @@ def _hf_download(cmd_args: list[str]) -> str:
         "download",
         *cmd_args,
     ]
-    log.info(f"{shlex.join(cmd)}")
     env = dict(os.environ)
     # Respect caller-provided offline mode and make it effective for the whole command.
     if env.get("HF_HUB_OFFLINE") == "1":
@@ -172,12 +172,35 @@ def _hf_download(cmd_args: list[str]) -> str:
         env.setdefault("HF_DATASETS_OFFLINE", "1")
         env.setdefault("UV_OFFLINE", "1")
 
-    # Run only once (quiet mode prints the resolved local path to stdout).
-    result = subprocess.run([*cmd, "--quiet"], text=True, env=env, capture_output=True, check=True)
-    path = result.stdout.strip()
-    if not path:
-        raise RuntimeError(f"Failed to resolve HF download path for command: {shlex.join(cmd)}")
-    return path
+    # Prefer existing `hf` CLI to avoid bootstrapping `uvx` in offline environments.
+    # For file download calls, keep `filename` right after `repo_id` for argparse compatibility.
+    hf_cmd: list[str] | None = None
+    if shutil.which("hf") is not None:
+        is_dir_download = "--include" in cmd_args or "--exclude" in cmd_args
+        if not is_dir_download and cmd_args and not cmd_args[-1].startswith("--"):
+            repo_id = cmd_args[0]
+            filename = cmd_args[-1]
+            option_args = cmd_args[1:-1]
+            hf_cmd = ["hf", "download", repo_id, filename, *option_args]
+        else:
+            hf_cmd = ["hf", "download", *cmd_args]
+
+    errors: list[str] = []
+    for cmd in [hf_cmd, uvx_cmd]:
+        if cmd is None:
+            continue
+        log.info(f"{shlex.join(cmd)}")
+        result = subprocess.run([*cmd, "--quiet"], text=True, env=env, capture_output=True)
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or "<empty stderr>"
+            errors.append(f"{shlex.join(cmd)} (exit={result.returncode}): {stderr}")
+            continue
+        path = result.stdout.strip()
+        if path:
+            return path
+        errors.append(f"{shlex.join(cmd)}: command succeeded but returned empty path")
+
+    raise RuntimeError("Failed to resolve HF download path. " + " | ".join(errors))
 
 
 class _CheckpointHf(_CheckpointUri, ABC):

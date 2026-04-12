@@ -8,7 +8,8 @@ MASTER_PORT=${MASTER_PORT:-12341}
 EXPERIMENT="waymo_multiview_post_train"
 CHECKPOINT_PATH="/data/cosmos-transfer2.5/output/20260313_225508/cosmos_transfer_v2p5/waymo_multiview/waymo_5cam_post_train/checkpoints/iter_000011000/model_ema_bf16.pt"
 INPUT_FILE="${WAYMO_INPUT_FILE:-}"
-OUTPUT_DIR="outputs/waymo-autoregressive-mv"
+OUTPUT_DIR=""
+OUTPUT_DIR_SPECIFIED=false
 WAYMO_SPLIT="training"
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 WAYMO_DATA_ROOT="/data/waymo/inference"
@@ -23,7 +24,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --output|-o)
-            OUTPUT_DIR="$2"            
+            OUTPUT_DIR="$2"
+            OUTPUT_DIR_SPECIFIED=true
             shift 2
             ;;
         --split)
@@ -54,11 +56,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-OUTPUT_DIR="outputs/waymo-mv-${WAYMO_SPLIT}-${TIMESTAMP}"
+if [ "$OUTPUT_DIR_SPECIFIED" = false ]; then
+    OUTPUT_DIR="outputs/waymo-mv-${WAYMO_SPLIT}-${TIMESTAMP}"
+fi
+
+get_spec_name_from_filename() {
+    local spec_path="$1"
+    local spec_file
+    spec_file="$(basename "$spec_path")"
+    echo "${spec_file%.json}"
+}
 
 # ==================== Check Parameters ====================
 echo "========================================"
-echo "🚀 Cosmos-Transfer2.5 Inference Script (Assets Autoregressive)"
+echo "🚀 Cosmos-Transfer2.5 Inference Script (Waymo Autoregressive)"
 echo "========================================"
 echo "📁 Input File:   ${INPUT_FILE:-<Not specified, will iterate through specs directory>}"
 echo "📂 Output Directory:   $OUTPUT_DIR"
@@ -90,6 +101,8 @@ elif [ ! -f "$INPUT_FILE" ]; then
     exit 1
 fi
 
+mkdir -p "$OUTPUT_DIR"
+
 if [ "$OFFLINE_MODE" = true ]; then
     export HF_HUB_OFFLINE=1
     export TRANSFORMERS_OFFLINE=1
@@ -98,10 +111,24 @@ if [ "$OFFLINE_MODE" = true ]; then
     export UV_OFFLINE=1
     export UV_NO_PROGRESS=1
     echo "📦 Setting offline cache environment variables: HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 UV_OFFLINE=1 UV_NO_PROGRESS=1"
+
+    # Prefer shared HF cache when available (commonly pre-populated on training/inference servers).
+    if [ -d "/data/huggingface/hub" ]; then
+        export HF_HOME="${HF_HOME:-/data/huggingface}"
+        export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+        echo "📦 Using HuggingFace cache: HF_HOME=$HF_HOME HF_HUB_CACHE=$HF_HUB_CACHE"
+    fi
 fi
 
 # ==================== Start Inference ====================
 if [ -n "$INPUT_FILE" ]; then
+    SAMPLE_NAME="$(get_spec_name_from_filename "$INPUT_FILE")"
+    if [ -d "$OUTPUT_DIR/$SAMPLE_NAME" ]; then
+        echo "⏭️  Found existing output folder, skipping spec: $SAMPLE_NAME"
+        echo "📌 Existing folder: $OUTPUT_DIR/$SAMPLE_NAME"
+        exit 0
+    fi
+
     echo "🔧 Starting distributed inference with torchrun ($NUM_GPUS GPUs)..."
     CMD="torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m examples.multiview -i $INPUT_FILE -o $OUTPUT_DIR --checkpoint_path $CHECKPOINT_PATH --experiment $EXPERIMENT --disable-guardrails"
     echo "📝 Executing command: $CMD"
@@ -115,19 +142,41 @@ if [ -n "$INPUT_FILE" ]; then
         --checkpoint_path "$CHECKPOINT_PATH" \
         --disable-guardrails
 else
-    echo "🔧 Starting distributed inference with torchrun ($NUM_GPUS GPUs)..."
     if [ -n "$ZSH_VERSION" ]; then
         setopt null_glob
     elif [ -n "$BASH_VERSION" ]; then
         shopt -s nullglob
     fi
+
     SPECS=("$SPEC_DIR"/*.json)
-    echo "📝 Number of spec: ${#SPECS[@]}"
+    if [ ${#SPECS[@]} -eq 0 ]; then
+        echo "❌ Error: no spec files found in $SPEC_DIR"
+        exit 1
+    fi
+
+    PENDING_SPECS=()
+    COMPLETED_COUNT=0
+    for spec in "${SPECS[@]}"; do
+        SAMPLE_NAME="$(get_spec_name_from_filename "$spec")"
+        if [ -d "$OUTPUT_DIR/$SAMPLE_NAME" ]; then
+            COMPLETED_COUNT=$((COMPLETED_COUNT + 1))
+            continue
+        fi
+        PENDING_SPECS+=("$spec")
+    done
+
+    echo "📝 Number of spec (total/completed/pending): ${#SPECS[@]}/$COMPLETED_COUNT/${#PENDING_SPECS[@]}"
+    if [ ${#PENDING_SPECS[@]} -eq 0 ]; then
+        echo "✅ All specs are already completed in '$OUTPUT_DIR'. Nothing to run."
+        exit 0
+    fi
+
+    echo "🔧 Starting distributed inference with torchrun ($NUM_GPUS GPUs)..."
     torchrun \
         --nproc_per_node="$NUM_GPUS" \
         --master_port="$MASTER_PORT" \
         -m examples.multiview \
-        -i "${SPECS[@]}" \
+        -i "${PENDING_SPECS[@]}" \
         -o "$OUTPUT_DIR" \
         --experiment "$EXPERIMENT" \
         --checkpoint_path "$CHECKPOINT_PATH" \
