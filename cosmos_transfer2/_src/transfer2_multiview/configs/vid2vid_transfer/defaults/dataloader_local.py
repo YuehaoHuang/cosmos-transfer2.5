@@ -235,11 +235,15 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
         augmentation_config: AugmentationConfig,
         folder_to_camera_key: dict[str, str],
         control_dir_name: str = "world_scenario",
+        include_lidar_alignment_metadata: bool = False,
+        lidar_chunk_stride_frames: int = 10,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.augmentation_config = augmentation_config
         self.folder_to_camera_key = folder_to_camera_key
         self.control_dir_name = control_dir_name
+        self.include_lidar_alignment_metadata = include_lidar_alignment_metadata
+        self.lidar_chunk_stride_frames = lidar_chunk_stride_frames
 
         print(f"Loading captions from {caption_json_path}...")
         with open(caption_json_path, "r") as f:
@@ -302,6 +306,15 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
         torch.utils.data.Dataset.__init__(self)
         self.augmentations, self.dataset_keys = make_augmentations(augmentation_config)
 
+    @staticmethod
+    def _split_chunk_name(sample_name: str) -> tuple[str, int]:
+        if "_" not in sample_name:
+            return sample_name, 0
+        base_name, maybe_chunk_idx = sample_name.rsplit("_", 1)
+        if maybe_chunk_idx.isdigit():
+            return base_name, int(maybe_chunk_idx)
+        return sample_name, 0
+
     def __getitem__(self, index: int) -> dict:
         max_retries = 10
         num_samples = len(self.video_file_dicts)
@@ -359,6 +372,16 @@ class WaymoMultiviewDataset(LocalMultiViewDataset):
                     break
 
             if sample is not None:
+                if self.include_lidar_alignment_metadata:
+                    segment_key, chunk_index = self._split_chunk_name(sample_name)
+                    lidar_frame_start = chunk_index * self.lidar_chunk_stride_frames + frame_start
+                    lidar_frame_end = lidar_frame_start + self.augmentation_config.num_video_frames
+                    sample["waymo_segment_key"] = segment_key
+                    sample["waymo_chunk_index"] = torch.tensor(chunk_index, dtype=torch.int64)
+                    sample["waymo_chunk_frame_indices"] = torch.arange(frame_start, frame_end, dtype=torch.int64)
+                    sample["waymo_lidar_frame_indices"] = torch.arange(
+                        lidar_frame_start, lidar_frame_end, dtype=torch.int64
+                    )
                 return sample
 
         raise RuntimeError(f"Failed to build a valid Waymo sample after {max_retries} retries (start index={index}).")

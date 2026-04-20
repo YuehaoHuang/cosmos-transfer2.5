@@ -212,3 +212,4 @@ cython_debug/
 !assets/**/*.mp4
 
 third_party_ref_repo
+.claude/scheduled_tasks.lock
