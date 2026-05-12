@@ -679,6 +679,10 @@ def read_and_process_control_input(
             "interpolation": None,
             "fallback_msg": None,
         },
+        "rangemap_layout": {
+            "interpolation": cv2.INTER_NEAREST,
+            "fallback_msg": None,
+        },
     }
 
     for modality in hint_key:

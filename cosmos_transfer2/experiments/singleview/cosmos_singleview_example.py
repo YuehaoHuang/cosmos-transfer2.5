@@ -27,6 +27,7 @@ Example usage:
 """
 
 import os
+from copy import deepcopy
 
 from hydra.core.config_store import ConfigStore
 
@@ -98,6 +99,91 @@ transfer2_singleview_posttrain_edge_example = dict(
     model_parallel=dict(
         context_parallel_size=int(os.environ.get("WORLD_SIZE", "1")),
     ),
+)
+
+
+# =============================================================================
+# Post-training Waymo TOP LiDAR Range-Map Video with Range-Map Layout Control
+# =============================================================================
+
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout = dict(
+    defaults=[
+        DEFAULT_BASE_EXPERIMENT,
+        {"override /data_train": "example_singleview_train_data_rangemap_layout"},
+    ],
+    job=dict(
+        project="cosmos_transfer2_posttrain",
+        group="waymo_lidar_singleview",
+        name="transfer2_singleview_posttrain_waymo_lidar_rangemap_layout",
+    ),
+    checkpoint=dict(
+        save_iter=500,
+        load_path=EDGE_CHECKPOINT.s3.uri,
+        load_training_state=False,
+        strict_resume=False,
+        load_from_object_store=dict(enabled=False),
+        save_to_object_store=dict(enabled=False),
+    ),
+    model=dict(
+        config=dict(
+            hint_keys="rangemap_layout",
+            min_num_conditional_frames=0,
+            max_num_conditional_frames=0,
+            conditional_frames_probs={0: 1.0},
+            state_t=8,
+            base_load_from=None,
+            net=dict(
+                rope_t_extrapolation_ratio=8.0 / 24.0,
+            ),
+        ),
+    ),
+    dataloader_train=dict(
+        dataset=dict(
+            num_frames=29,
+            video_size=(704, 1280),
+            resolution="720",
+            hint_key="control_input_rangemap_layout",
+        ),
+    ),
+    trainer=dict(
+        max_iter=5000,
+        straggler_detection=dict(enabled=False),
+        callbacks=dict(
+            heart_beat=dict(save_s3=False),
+            iter_speed=dict(save_s3=False),
+            device_monitor=dict(save_s3=False),
+            every_n_sample_reg=dict(save_s3=False, every_n=500),
+            every_n_sample_ema=dict(save_s3=False, every_n=500),
+            wandb=dict(save_s3=False),
+            wandb_10x=dict(save_s3=False),
+            dataloader_speed=dict(save_s3=False),
+            frame_loss_log=dict(save_s3=False),
+        ),
+    ),
+    scheduler=dict(
+        warm_up_steps=[1000],
+        cycle_lengths=[5000],
+    ),
+    model_parallel=dict(
+        context_parallel_size=int(os.environ.get("WORLD_SIZE", "1")),
+    ),
+)
+
+
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune = deepcopy(
+    transfer2_singleview_posttrain_waymo_lidar_rangemap_layout
+)
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["job"].update(
+    name="transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune"
+)
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["model"]["config"][
+    "freeze_base_model"
+] = False
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["optimizer"] = dict(
+    lr="1.0e-05",
+)
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["scheduler"].update(
+    warm_up_steps=[500],
 )
 
 
@@ -280,6 +366,8 @@ cs = ConfigStore.instance()
 
 for _item in [
     transfer2_singleview_posttrain_edge_example,
+    transfer2_singleview_posttrain_waymo_lidar_rangemap_layout,
+    transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune,
     transfer2_singleview_posttrain_depth_example,
     transfer2_singleview_posttrain_seg_example,
     transfer2_singleview_posttrain_vis_example,

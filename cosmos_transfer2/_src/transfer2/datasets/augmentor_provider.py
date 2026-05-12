@@ -833,3 +833,34 @@ def get_hdmap_augmentor_for_local_datasets(
             input_keys=["hdmap_bbox"], output_keys=["control_input_hdmap_bbox"], use_random=False
         ),
     }
+
+
+@augmentor_register("rangemap_layout_augmentor_for_local_datasets")
+def get_rangemap_layout_augmentor_for_local_datasets(
+    resolution: str,
+    caption_type: str = "t2w_qwen2p5_7b",
+    embedding_type: str = "t5_xxl",
+    **kwargs,
+):
+    """Local augmentor for precomputed LiDAR range-map layout controls."""
+    return {
+        "resize_largest_side_aspect_ratio_preserving": L(resize.ResizeLargestSideAspectPreserving)(
+            input_keys=["video"],
+            args={"size": VIDEO_RES_SIZE_INFO[resolution]},
+        ),
+        "reflection_padding": L(padding.ReflectionPadding)(
+            input_keys=["video"],
+            args={"size": VIDEO_RES_SIZE_INFO[resolution]},
+        ),
+        "resize_largest_side_aspect_ratio_preserving_cond": L(resize.ResizeLargestSideAspectPreserving)(
+            input_keys=["rangemap_layout"],
+            args={"size": VIDEO_RES_SIZE_INFO[resolution]},
+        ),
+        "reflection_padding_cond": L(padding.ReflectionPadding)(
+            input_keys=["rangemap_layout"],
+            args={"size": VIDEO_RES_SIZE_INFO[resolution]},
+        ),
+        "add_control_input": L(control_input.AddControlInputRangemapLayout)(
+            input_keys=["rangemap_layout"], output_keys=["control_input_rangemap_layout"], use_random=False
+        ),
+    }

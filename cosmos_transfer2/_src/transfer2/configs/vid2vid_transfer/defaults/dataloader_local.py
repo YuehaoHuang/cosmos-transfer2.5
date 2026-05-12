@@ -132,3 +132,28 @@ def register_dataloader_local() -> None:
             pin_memory=True,
         ),
     )
+
+    # Waymo TOP LiDAR range-map generation with precomputed range-map layout control.
+    dataset_rangemap_layout = L(SingleViewTransferDataset)(
+        dataset_dir="PLACEHOLDER_UPDATE_DATASET_PATH",
+        num_frames=29,
+        video_size=(704, 1280),
+        resolution="720",
+        hint_key="control_input_rangemap_layout",
+        is_train=True,
+        caption_type="t2w_qwen2p5_7b",
+    )
+
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="example_singleview_train_data_rangemap_layout",
+        node=L(get_generic_dataloader)(
+            dataset=dataset_rangemap_layout,
+            sampler=L(get_sampler)(dataset=dataset_rangemap_layout) if dist.is_initialized() else None,
+            batch_size=1,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+        ),
+    )

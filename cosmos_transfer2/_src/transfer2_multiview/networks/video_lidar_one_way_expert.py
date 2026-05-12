@@ -13,6 +13,7 @@ reads LiDAR tokens.
 from __future__ import annotations
 
 import ast
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -28,9 +29,13 @@ try:
 except ImportError:  # pragma: no cover - compatibility with older torch builds
     SDPBackend = None
     sdpa_kernel = None
+try:
+    from torch.distributed._composable.fsdp import fully_shard as _fsdp_fully_shard
+except ImportError:  # pragma: no cover - FSDP2 is optional for non-training paths
+    _fsdp_fully_shard = None
 
 from cosmos_transfer2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
-from cosmos_transfer2._src.predict2.networks.minimal_v4_dit import Block, CheckpointMode, SACConfig
+from cosmos_transfer2._src.predict2.networks.minimal_v4_dit import Block, CheckpointMode, SACConfig, VideoSize
 from cosmos_transfer2._src.predict2_multiview.networks.multiview_dit import MultiViewDiT
 from cosmos_transfer2._src.transfer2_multiview.networks.video_lidar_joint_policy import VideoLidarAttentionPolicy
 
@@ -102,6 +107,12 @@ def _make_condition_mask(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     return torch.zeros((batch_size, 1, timesteps, height, width), device=device, dtype=dtype)
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        raise ValueError(f"multiple must be > 0, got {multiple}.")
+    return ((value + multiple - 1) // multiple) * multiple
 
 
 def _null_crossattn(
@@ -199,6 +210,109 @@ def _modulate_5d(x: torch.Tensor, norm_layer: nn.Module, scale: torch.Tensor, sh
     return norm_layer(x) * (1 + scale) + shift
 
 
+def _forward_frozen_video_block_with_optional_kv(
+    *,
+    video_block: Block,
+    video_tokens: torch.Tensor,
+    video_rope_emb: Optional[torch.Tensor],
+    video_extra_pos_emb: Optional[torch.Tensor],
+    video_t_embedding: torch.Tensor,
+    video_adaln_lora: Optional[torch.Tensor],
+    video_crossattn_emb: torch.Tensor,
+    return_kv: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Advance one frozen video block and optionally expose its self-attn K/V.
+
+    This keeps the one-way baseline isolated from the standard video generation
+    path while avoiding duplicated frozen-video QKV projection work.
+    """
+
+    if video_extra_pos_emb is not None:
+        video_tokens = video_tokens + video_extra_pos_emb.to(device=video_tokens.device, dtype=video_tokens.dtype)
+
+    autocast_enabled = video_tokens.device.type == "cuda" and video_block.use_wan_fp32_strategy
+    with amp.autocast("cuda", enabled=autocast_enabled, dtype=torch.float32):
+        if video_block.use_adaln_lora:
+            assert video_adaln_lora is not None
+            video_shift_self, video_scale_self, video_gate_self = (
+                video_block.adaln_modulation_self_attn(video_t_embedding) + video_adaln_lora
+            ).chunk(3, dim=-1)
+            video_shift_cross, video_scale_cross, video_gate_cross = (
+                video_block.adaln_modulation_cross_attn(video_t_embedding) + video_adaln_lora
+            ).chunk(3, dim=-1)
+            video_shift_mlp, video_scale_mlp, video_gate_mlp = (
+                video_block.adaln_modulation_mlp(video_t_embedding) + video_adaln_lora
+            ).chunk(3, dim=-1)
+        else:
+            video_shift_self, video_scale_self, video_gate_self = video_block.adaln_modulation_self_attn(
+                video_t_embedding
+            ).chunk(3, dim=-1)
+            video_shift_cross, video_scale_cross, video_gate_cross = video_block.adaln_modulation_cross_attn(
+                video_t_embedding
+            ).chunk(3, dim=-1)
+            video_shift_mlp, video_scale_mlp, video_gate_mlp = video_block.adaln_modulation_mlp(
+                video_t_embedding
+            ).chunk(3, dim=-1)
+
+    video_shift_self = rearrange(video_shift_self, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_scale_self = rearrange(video_scale_self, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_gate_self = rearrange(video_gate_self, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_shift_cross = rearrange(video_shift_cross, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_scale_cross = rearrange(video_scale_cross, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_gate_cross = rearrange(video_gate_cross, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_shift_mlp = rearrange(video_shift_mlp, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_scale_mlp = rearrange(video_scale_mlp, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+    video_gate_mlp = rearrange(video_gate_mlp, "b t d -> b t 1 1 d").to(dtype=video_tokens.dtype)
+
+    normalized_video = _modulate_5d(
+        video_tokens,
+        video_block.layer_norm_self_attn,
+        video_scale_self,
+        video_shift_self,
+    )
+    _, video_t, video_h, video_w, _ = normalized_video.shape
+    video_flat = rearrange(normalized_video, "b t h w d -> b (t h w) d")
+    q_v, k_v, v_v = video_block.self_attn.compute_qkv(video_flat, rope_emb=video_rope_emb)
+    video_size = VideoSize(T=video_t, H=video_h, W=video_w)
+    if video_block.cp_size is not None and video_block.cp_size > 1:
+        video_size = VideoSize(T=video_t * video_block.cp_size, H=video_h, W=video_w)
+
+    self_attn_out = rearrange(
+        video_block.self_attn.compute_attention(q_v, k_v, v_v, video_size=video_size),
+        "b (t h w) d -> b t h w d",
+        t=video_t,
+        h=video_h,
+        w=video_w,
+    )
+    x = video_tokens + video_gate_self * self_attn_out
+    return_k_v = k_v if return_kv else None
+    return_v_v = v_v if return_kv else None
+    del normalized_video, video_flat, q_v, k_v, v_v, self_attn_out
+
+    cross_norm = _modulate_5d(x, video_block.layer_norm_cross_attn, video_scale_cross, video_shift_cross)
+    cross_out = rearrange(
+        video_block.cross_attn(
+            rearrange(cross_norm, "b t h w d -> b (t h w) d"),
+            video_crossattn_emb,
+            rope_emb=video_rope_emb,
+        ),
+        "b (t h w) d -> b t h w d",
+        t=video_t,
+        h=video_h,
+        w=video_w,
+    )
+    x = x + video_gate_cross * cross_out
+    del cross_norm, cross_out
+
+    mlp_norm = _modulate_5d(x, video_block.layer_norm_mlp, video_scale_mlp, video_shift_mlp)
+    mlp_out = video_block.mlp(mlp_norm)
+    x = x + video_gate_mlp * mlp_out
+    del mlp_norm, mlp_out
+    if not return_kv:
+        return x, None, None
+    return x, return_k_v, return_v_v
+
+
 @dataclass(frozen=True)
 class WaymoFrozenVideoExpertConfig:
     checkpoint_path: str = DEFAULT_WAYMO_VIDEO_CHECKPOINT
@@ -265,30 +379,75 @@ def load_frozen_waymo_video_expert(
     kwargs = load_waymo_video_expert_kwargs(config_path)
     video_expert = MultiViewDiT(**kwargs)
 
-    state = torch.load(checkpoint_path, map_location="cpu")
-    stripped_state = {key.removeprefix("net."): value for key, value in state.items() if key.startswith("net.")}
-    incompatible = video_expert.load_state_dict(stripped_state, strict=False)
-    allowed_unexpected_prefixes = (
-        "control_embedder.",
-        "control_blocks.",
-        "input_hint_block.",
-        "accum_",
-    )
-    unexpected = [
-        key for key in incompatible.unexpected_keys if not key.startswith(allowed_unexpected_prefixes)
-    ]
-    if unexpected:
-        raise RuntimeError(f"Unexpected frozen video weights when loading {checkpoint_path}: {unexpected[:20]}")
-    if incompatible.missing_keys:
-        raise RuntimeError(
-            f"Missing frozen video weights when loading {checkpoint_path}: {incompatible.missing_keys[:20]}"
+    rank0_only = os.environ.get("COSMOS_ONE_WAY_LOAD_FROZEN_VIDEO_RANK0_ONLY") == "1"
+    load_checkpoint = True
+    if rank0_only and torch.distributed.is_available() and torch.distributed.is_initialized():
+        load_checkpoint = torch.distributed.get_rank() == 0
+
+    if load_checkpoint:
+        state = torch.load(checkpoint_path, map_location="cpu")
+        stripped_state = {key.removeprefix("net."): value for key, value in state.items() if key.startswith("net.")}
+        incompatible = video_expert.load_state_dict(stripped_state, strict=False)
+        allowed_unexpected_prefixes = (
+            "control_embedder.",
+            "control_blocks.",
+            "input_hint_block.",
+            "accum_",
         )
+        unexpected = [
+            key for key in incompatible.unexpected_keys if not key.startswith(allowed_unexpected_prefixes)
+        ]
+        if unexpected:
+            raise RuntimeError(f"Unexpected frozen video weights when loading {checkpoint_path}: {unexpected[:20]}")
+        if incompatible.missing_keys:
+            raise RuntimeError(
+                f"Missing frozen video weights when loading {checkpoint_path}: {incompatible.missing_keys[:20]}"
+            )
 
     video_expert.to(device=_device_from_arg(device), dtype=dtype)
     video_expert.eval()
     for param in video_expert.parameters():
         param.requires_grad_(False)
     return video_expert
+
+
+def override_wan_fp32_strategy(module: nn.Module, enabled: bool) -> None:
+    """Recursively override Wan FP32 forward policy for a loaded module tree."""
+
+    for submodule in module.modules():
+        if hasattr(submodule, "use_wan_fp32_strategy"):
+            submodule.use_wan_fp32_strategy = enabled
+
+
+def initialize_lidar_expert_from_video(
+    lidar_expert: nn.Module,
+    video_expert: nn.Module,
+) -> tuple[int, int, int]:
+    """Copy same-shape frozen-video weights into the LiDAR expert.
+
+    The LiDAR expert has different patch/input geometry, so some tensors
+    intentionally do not match. Loading only same-shape keys gives the LiDAR
+    branch the trained DiT prior without constraining LiDAR-specific modules.
+    """
+
+    lidar_state = lidar_expert.state_dict()
+    video_state = video_expert.state_dict()
+    copied: dict[str, torch.Tensor] = {}
+    copied_block_ids: set[int] = set()
+    skipped = 0
+    for key, lidar_tensor in lidar_state.items():
+        video_tensor = video_state.get(key)
+        if video_tensor is None or tuple(video_tensor.shape) != tuple(lidar_tensor.shape):
+            skipped += 1
+            continue
+        copied[key] = video_tensor.detach().to(device=lidar_tensor.device, dtype=lidar_tensor.dtype)
+        if key.startswith("blocks."):
+            parts = key.split(".")
+            if len(parts) > 1 and parts[1].isdigit():
+                copied_block_ids.add(int(parts[1]))
+    lidar_state.update(copied)
+    lidar_expert.load_state_dict(lidar_state, strict=True)
+    return len(copied), skipped, len(copied_block_ids)
 
 
 @torch.no_grad()
@@ -342,6 +501,8 @@ def extract_frozen_video_context(
     scaled_timesteps = scaled_timesteps * video_expert.timestep_scale
 
     autocast_enabled = noisy_video.device.type == "cuda" and video_expert.use_wan_fp32_strategy
+    if not autocast_enabled:
+        scaled_timesteps = scaled_timesteps.to(dtype=expert_dtype)
     with amp.autocast("cuda", enabled=autocast_enabled, dtype=torch.float32):
         t_embedding, adaln_lora = video_expert.t_embedder(scaled_timesteps)
         t_embedding = video_expert.t_embedding_norm(t_embedding)
@@ -384,6 +545,25 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
             tuple[Any, ...],
             tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]],
         ] = {}
+
+    def fully_shard(self, mesh: Any, *, reshard_after_forward: bool = True) -> None:
+        """Apply Cosmos-style FSDP2 wrapping to the trainable LiDAR expert."""
+
+        if _fsdp_fully_shard is None:
+            raise RuntimeError("torch.distributed._composable.fsdp.fully_shard is unavailable in this PyTorch build.")
+        for block in self.blocks:
+            _fsdp_fully_shard(block, mesh=mesh, reshard_after_forward=reshard_after_forward)
+        for module_name in (
+            "x_embedder",
+            "t_embedder",
+            "t_embedding_norm",
+            "crossattn_proj",
+            "extra_pos_embedder",
+            "final_layer",
+        ):
+            module = getattr(self, module_name, None)
+            if isinstance(module, nn.Module):
+                _fsdp_fully_shard(module, mesh=mesh, reshard_after_forward=reshard_after_forward)
 
     def _build_same_step_indices(
         self,
@@ -544,9 +724,26 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
         crossattn_emb: Optional[torch.Tensor] = None,
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        tuple[int, int],
+    ]:
         expert_dtype = self.x_embedder.proj[1].weight.dtype
         noisy_lidar = noisy_lidar.to(dtype=expert_dtype)
+        original_hw = (int(noisy_lidar.shape[-2]), int(noisy_lidar.shape[-1]))
+        pad_h = (-original_hw[0]) % self.patch_spatial
+        pad_w = (-original_hw[1]) % self.patch_spatial
+        if pad_h or pad_w:
+            noisy_lidar = F.pad(noisy_lidar, (0, pad_w, 0, pad_h))
+            if padding_mask is not None:
+                if padding_mask.ndim == 3:
+                    padding_mask = padding_mask.unsqueeze(1)
+                padding_mask = F.pad(padding_mask, (0, pad_w, 0, pad_h))
         batch_size, _, total_t, height, width = noisy_lidar.shape
         device = noisy_lidar.device
         dtype = noisy_lidar.dtype
@@ -572,10 +769,12 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
         scaled_timesteps = scaled_timesteps * self.timestep_scale
 
         autocast_enabled = noisy_lidar.device.type == "cuda" and self.use_wan_fp32_strategy
+        if not autocast_enabled:
+            scaled_timesteps = scaled_timesteps.to(dtype=expert_dtype)
         with amp.autocast("cuda", enabled=autocast_enabled, dtype=torch.float32):
             t_embedding, adaln_lora = self.t_embedder(scaled_timesteps)
             t_embedding = self.t_embedding_norm(t_embedding)
-        return x_tokens, rope_emb, extra_pos_emb, t_embedding, adaln_lora, crossattn_emb
+        return x_tokens, rope_emb, extra_pos_emb, t_embedding, adaln_lora, crossattn_emb, original_hw
 
     def _forward_one_way_block(
         self,
@@ -594,6 +793,7 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
         crossattn_emb: torch.Tensor,
         extra_pos_emb: Optional[torch.Tensor],
         use_video_kv: bool = True,
+        precomputed_video_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if extra_pos_emb is not None:
             lidar_tokens = lidar_tokens + extra_pos_emb
@@ -637,28 +837,36 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
         k_v = v_v = None
         keep_video = use_video_kv and self.policy.mode in ("video_to_lidar", "bidirectional")
         if keep_video:
-            video_dtype = video_block.self_attn.q_proj.weight.dtype
-            video_tokens = video_tokens.to(dtype=video_dtype)
-            if video_extra_pos_emb is not None:
-                video_tokens = video_tokens + video_extra_pos_emb.to(device=video_tokens.device, dtype=video_dtype)
-            with amp.autocast("cuda", enabled=autocast_enabled, dtype=torch.float32):
-                video_t_embedding = video_t_embedding.to(device=video_tokens.device, dtype=video_dtype)
-                if video_adaln_lora is not None:
-                    video_adaln_lora = video_adaln_lora.to(device=video_tokens.device, dtype=video_dtype)
-                if video_block.use_adaln_lora:
-                    assert video_adaln_lora is not None
-                    video_shift_self, video_scale_self, _ = (
-                        video_block.adaln_modulation_self_attn(video_t_embedding) + video_adaln_lora
-                    ).chunk(3, dim=-1)
-                else:
-                    video_shift_self, video_scale_self, _ = video_block.adaln_modulation_self_attn(
-                        video_t_embedding
-                    ).chunk(3, dim=-1)
-            video_shift_self = rearrange(video_shift_self, "b t d -> b t 1 1 d").to(dtype=video_dtype)
-            video_scale_self = rearrange(video_scale_self, "b t d -> b t 1 1 d").to(dtype=video_dtype)
-            video_norm = _modulate_5d(video_tokens, video_block.layer_norm_self_attn, video_scale_self, video_shift_self)
-            video_flat = rearrange(video_norm, "b t h w d -> b (t h w) d")
-            _, k_v, v_v = video_block.self_attn.compute_qkv(video_flat, rope_emb=video_rope_emb)
+            if precomputed_video_kv is not None:
+                k_v, v_v = precomputed_video_kv
+            else:
+                video_dtype = video_block.self_attn.q_proj.weight.dtype
+                video_tokens = video_tokens.to(dtype=video_dtype)
+                if video_extra_pos_emb is not None:
+                    video_tokens = video_tokens + video_extra_pos_emb.to(device=video_tokens.device, dtype=video_dtype)
+                with amp.autocast("cuda", enabled=autocast_enabled, dtype=torch.float32):
+                    video_t_embedding = video_t_embedding.to(device=video_tokens.device, dtype=video_dtype)
+                    if video_adaln_lora is not None:
+                        video_adaln_lora = video_adaln_lora.to(device=video_tokens.device, dtype=video_dtype)
+                    if video_block.use_adaln_lora:
+                        assert video_adaln_lora is not None
+                        video_shift_self, video_scale_self, _ = (
+                            video_block.adaln_modulation_self_attn(video_t_embedding) + video_adaln_lora
+                        ).chunk(3, dim=-1)
+                    else:
+                        video_shift_self, video_scale_self, _ = video_block.adaln_modulation_self_attn(
+                            video_t_embedding
+                        ).chunk(3, dim=-1)
+                video_shift_self = rearrange(video_shift_self, "b t d -> b t 1 1 d").to(dtype=video_dtype)
+                video_scale_self = rearrange(video_scale_self, "b t d -> b t 1 1 d").to(dtype=video_dtype)
+                video_norm = _modulate_5d(
+                    video_tokens,
+                    video_block.layer_norm_self_attn,
+                    video_scale_self,
+                    video_shift_self,
+                )
+                video_flat = rearrange(video_norm, "b t h w d -> b (t h w) d")
+                _, k_v, v_v = video_block.self_attn.compute_qkv(video_flat, rope_emb=video_rope_emb)
             k_v = k_v.to(dtype=q_l.dtype)
             v_v = v_v.to(dtype=q_l.dtype)
 
@@ -741,6 +949,7 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
             t_embedding,
             adaln_lora,
             crossattn_emb,
+            original_hw,
         ) = self._prepare_inputs(
             noisy_lidar,
             timesteps,
@@ -769,7 +978,7 @@ class VideoConditionedLidarExpert(MinimalV1LVGDiT):
             )
 
         pred_tokens = self.final_layer(lidar_tokens, t_embedding, adaln_lora_B_T_3D=adaln_lora)
-        return self.unpatchify(pred_tokens)
+        return self.unpatchify(pred_tokens)[..., : original_hw[0], : original_hw[1]]
 
 
 class VideoLidarOneWayExpertBaseline(nn.Module):
@@ -789,6 +998,18 @@ class VideoLidarOneWayExpertBaseline(nn.Module):
         for param in self.video_expert.parameters():
             param.requires_grad_(False)
         self.video_expert.eval()
+
+    def fully_shard_lidar_expert(self, mesh: Any, *, reshard_after_forward: bool = True) -> None:
+        """Shard only the trainable LiDAR expert; keep the frozen video path replicated."""
+
+        if _fsdp_fully_shard is None:
+            raise RuntimeError("torch.distributed._composable.fsdp.fully_shard is unavailable in this PyTorch build.")
+        self.lidar_expert.fully_shard(mesh, reshard_after_forward=reshard_after_forward)
+        self.lidar_expert = _fsdp_fully_shard(
+            self.lidar_expert,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+        )
 
     def forward(
         self,
@@ -839,6 +1060,7 @@ class VideoLidarOneWayExpertBaseline(nn.Module):
             lidar_t_embedding,
             lidar_adaln_lora,
             lidar_crossattn_emb,
+            lidar_original_hw,
         ) = self.lidar_expert._prepare_inputs(
             noisy_lidar,
             lidar_timesteps,
@@ -850,6 +1072,31 @@ class VideoLidarOneWayExpertBaseline(nn.Module):
         video_tokens = video_context.tokens
         for layer_idx, (video_block, lidar_block) in enumerate(zip(self.video_expert.blocks, self.lidar_expert.blocks)):
             use_video_kv = layer_idx % self.lidar_expert.video_kv_every_n_layers == 0
+            # Updating the frozen video block after a no-checkpoint LiDAR block keeps
+            # all LiDAR activations live during the video MLP peak. Advance video
+            # first and aggressively release frozen-video temporaries instead.
+            low_mem_video_schedule = False
+            precomputed_video_kv = None
+            next_video_tokens = None
+            if not low_mem_video_schedule:
+                with torch.no_grad():
+                    next_video_tokens, precomputed_k_v, precomputed_v_v = _forward_frozen_video_block_with_optional_kv(
+                        video_block=video_block,
+                        video_tokens=video_tokens,
+                        video_rope_emb=video_context.rope_emb,
+                        video_extra_pos_emb=video_context.extra_pos_emb,
+                        video_t_embedding=video_context.t_embedding.to(device=video_tokens.device),
+                        video_adaln_lora=(
+                            None
+                            if video_context.adaln_lora is None
+                            else video_context.adaln_lora.to(device=video_tokens.device)
+                        ),
+                        video_crossattn_emb=video_context.crossattn_emb,
+                        return_kv=use_video_kv,
+                    )
+                if precomputed_k_v is not None and precomputed_v_v is not None:
+                    precomputed_video_kv = (precomputed_k_v, precomputed_v_v)
+
             def _lidar_one_way_forward(
                 lidar_tokens_in: torch.Tensor,
                 *,
@@ -870,6 +1117,7 @@ class VideoLidarOneWayExpertBaseline(nn.Module):
                     crossattn_emb=lidar_crossattn_emb,
                     extra_pos_emb=lidar_extra_pos_emb,
                     use_video_kv=use_video_kv_for_layer,
+                    precomputed_video_kv=precomputed_video_kv,
                 )
 
             if self.training and self.checkpoint_lidar_blocks:
@@ -880,15 +1128,19 @@ class VideoLidarOneWayExpertBaseline(nn.Module):
                 )
             else:
                 lidar_tokens = _lidar_one_way_forward(lidar_tokens)
-            with torch.no_grad():
-                video_tokens = video_block(
-                    video_tokens,
-                    video_context.t_embedding,
-                    video_context.crossattn_emb,
-                    rope_emb_L_1_1_D=video_context.rope_emb,
-                    adaln_lora_B_T_3D=video_context.adaln_lora,
-                    extra_per_block_pos_emb=video_context.extra_pos_emb,
-                )
+            if low_mem_video_schedule:
+                with torch.no_grad():
+                    video_tokens = video_block(
+                        video_tokens,
+                        video_context.t_embedding,
+                        video_context.crossattn_emb,
+                        rope_emb_L_1_1_D=video_context.rope_emb,
+                        adaln_lora_B_T_3D=video_context.adaln_lora,
+                        extra_per_block_pos_emb=video_context.extra_pos_emb,
+                    )
+            else:
+                assert next_video_tokens is not None
+                video_tokens = next_video_tokens
 
         lidar_pred_tokens = self.lidar_expert.final_layer(
             lidar_tokens,
@@ -896,6 +1148,7 @@ class VideoLidarOneWayExpertBaseline(nn.Module):
             adaln_lora_B_T_3D=lidar_adaln_lora,
         )
         lidar_pred = self.lidar_expert.unpatchify(lidar_pred_tokens)
+        lidar_pred = lidar_pred[..., : lidar_original_hw[0], : lidar_original_hw[1]]
         outputs = {
             "lidar_pred": lidar_pred,
         }
@@ -918,12 +1171,15 @@ def build_waymo_video_lidar_one_way_expert_baseline(
     frozen_dtype: torch.dtype = torch.bfloat16,
     lidar_dtype: Optional[torch.dtype] = None,
     lidar_max_img_h: int = 64,
-    lidar_max_img_w: int = 112,
+    lidar_max_img_w: int = 226,
     lidar_max_frames: int = 8,
     lidar_attention_backend: str = "torch",
     lidar_num_blocks: Optional[int] = None,
     video_kv_every_n_layers: int = 1,
     checkpoint_lidar_blocks: bool = True,
+    frozen_video_use_wan_fp32_strategy: Optional[bool] = None,
+    lidar_use_wan_fp32_strategy: Optional[bool] = None,
+    init_lidar_from_video: bool = False,
     policy: VideoLidarAttentionPolicy = VideoLidarAttentionPolicy(
         mode="video_to_lidar",
         cross_frame_rule="same_step",
@@ -936,19 +1192,31 @@ def build_waymo_video_lidar_one_way_expert_baseline(
         device=device,
         dtype=frozen_dtype,
     )
+    if frozen_video_use_wan_fp32_strategy is not None:
+        override_wan_fp32_strategy(video_expert, frozen_video_use_wan_fp32_strategy)
     video_num_blocks = int(video_kwargs["num_blocks"])
     if lidar_num_blocks is None:
         lidar_num_blocks = video_num_blocks
     if lidar_num_blocks < 1 or lidar_num_blocks > video_num_blocks:
         raise ValueError(f"lidar_num_blocks must be in [1, {video_num_blocks}], got {lidar_num_blocks}.")
+    if lidar_num_blocks < video_num_blocks:
+        video_expert.blocks = nn.ModuleList(list(video_expert.blocks[:lidar_num_blocks]))
+        if _device_from_arg(device).type == "cuda":
+            torch.cuda.empty_cache()
     lidar_sac_config = SACConfig(mode=CheckpointMode.NONE) if not checkpoint_lidar_blocks else SACConfig()
+    lidar_patch_spatial = int(video_kwargs["patch_spatial"])
+    lidar_wan_fp32_strategy = (
+        bool(video_kwargs["use_wan_fp32_strategy"])
+        if lidar_use_wan_fp32_strategy is None
+        else lidar_use_wan_fp32_strategy
+    )
     lidar_expert = VideoConditionedLidarExpert(
-        max_img_h=lidar_max_img_h,
-        max_img_w=lidar_max_img_w,
+        max_img_h=_round_up_to_multiple(lidar_max_img_h, lidar_patch_spatial),
+        max_img_w=_round_up_to_multiple(lidar_max_img_w, lidar_patch_spatial),
         max_frames=lidar_max_frames,
         in_channels=int(video_kwargs["out_channels"]),
         out_channels=int(video_kwargs["out_channels"]),
-        patch_spatial=int(video_kwargs["patch_spatial"]),
+        patch_spatial=lidar_patch_spatial,
         patch_temporal=int(video_kwargs["patch_temporal"]),
         concat_padding_mask=True,
         model_channels=int(video_kwargs["model_channels"]),
@@ -970,16 +1238,25 @@ def build_waymo_video_lidar_one_way_expert_baseline(
         rope_enable_fps_modulation=bool(video_kwargs["rope_enable_fps_modulation"]),
         extra_per_block_abs_pos_emb=False,
         timestep_scale=float(video_kwargs["timestep_scale"]),
-        use_wan_fp32_strategy=bool(video_kwargs["use_wan_fp32_strategy"]),
+        use_wan_fp32_strategy=lidar_wan_fp32_strategy,
         sac_config=lidar_sac_config,
         video_crossattn_proj_in_channels=int(video_kwargs["crossattn_proj_in_channels"]),
         video_state_t=int(video_kwargs["state_t"]),
         video_kv_every_n_layers=video_kv_every_n_layers,
         policy=policy,
     )
+    override_wan_fp32_strategy(lidar_expert, lidar_wan_fp32_strategy)
     if lidar_dtype is None:
         lidar_dtype = frozen_dtype
     lidar_expert = lidar_expert.to(device=_device_from_arg(device), dtype=lidar_dtype)
+    if init_lidar_from_video:
+        copied, skipped, copied_blocks = initialize_lidar_expert_from_video(lidar_expert, video_expert)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"[one-way-init] initialized LiDAR expert from frozen video expert: "
+                f"copied={copied} skipped={skipped} copied_blocks={copied_blocks}/{lidar_num_blocks}",
+                flush=True,
+            )
     model = VideoLidarOneWayExpertBaseline(
         video_expert=video_expert,
         lidar_expert=lidar_expert,

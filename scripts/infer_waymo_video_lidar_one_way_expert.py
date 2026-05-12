@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Subset
 
+from cosmos_transfer2._src.predict2.models.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from cosmos_transfer2._src.predict2_multiview.datasets.multiview import collate_fn
 from cosmos_transfer2._src.transfer2_multiview.networks.video_lidar_joint_policy import VideoLidarAttentionPolicy
 from cosmos_transfer2._src.transfer2_multiview.networks.video_lidar_one_way_expert import (
@@ -34,16 +35,26 @@ from cosmos_transfer2._src.transfer2_multiview.networks.video_lidar_one_way_expe
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_waymo_lidar_s3_latents import _load_tokenizer  # noqa: E402
+from smoke_waymo_lidar_wan21_vae import load_wan_tokenizer  # noqa: E402
 from train_waymo_video_lidar_one_way_expert_baseline import (  # noqa: E402
     PairedLatentCacheDataset,
+    assert_checkpoint_lidar_contract,
+    checkpoint_rf_convention,
     collate_paired_latent_cache,
+    make_rf_noisy_and_target,
+    rf_discrete_timesteps,
+    rf_sigmas_from_timesteps,
 )
 from train_waymo_video_to_lidar_baseline import (  # noqa: E402
-    NORMAL_LIDAR_LATENT_HW,
     OnlineLidarS3Encoder,
     OnlineVideoEncoder,
     build_waymo_dataset,
     maybe_resize_lidar,
+)
+from waymo_lidar_latent_contracts import (  # noqa: E402
+    OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT,
+    lidar_latent_hw,
+    normalize_lidar_latent_contract,
 )
 
 
@@ -63,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--caption-json-path", default="/data/waymo/waymo_multiview_texts.json")
     parser.add_argument("--raw-lidar-root", default="/data2/rds_hq_waymo/lidar_tokenizer")
     parser.add_argument("--paired-latent-cache-dir", default=None)
+    parser.add_argument(
+        "--precomputed-video-latent-dir",
+        default=None,
+        help="Optional real video latent directory for flat paired caches. Linked caches use cache_dir/video automatically.",
+    )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--limit-samples", type=int, default=None)
@@ -72,7 +88,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frozen-video-dtype", default=None, choices=["float32", "bfloat16"])
     parser.add_argument("--seed", type=int, default=20260419)
     parser.add_argument("--sample-steps", type=int, default=8)
+    parser.add_argument("--save-intermediate-every", type=int, default=0)
+    parser.add_argument("--decode-intermediates", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--max-intermediate-preview-rows", type=int, default=24)
     parser.add_argument("--eval-t", type=float, default=0.5)
+    parser.add_argument("--rf-convention", default=None, choices=["predict2", "legacy_forward"])
+    parser.add_argument("--rf-shift", type=float, default=None)
+    parser.add_argument("--rf-num-train-timesteps", type=int, default=None)
     parser.add_argument("--sdpa-backends", default="flash_only", choices=["flash_only", "flash_mem", "flash_mem_math"])
     parser.add_argument("--video-conditioning-mode", default="teacher_forced_flow", choices=["teacher_forced_flow", "clean"])
     parser.add_argument("--save-video-latent", action="store_true")
@@ -81,15 +103,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-tokenizer", default=None, choices=["raw_downsample", "wan2pt1"])
     parser.add_argument("--video-tokenizer-batch-size", type=int, default=1)
     parser.add_argument("--wan-vae-path", default=None)
+    parser.add_argument("--allow-default-wan-uri", action="store_true")
     parser.add_argument("--wan-s3-credential-path", default="credentials/s3_training.secret")
     parser.add_argument("--video-expert-checkpoint", default=None)
     parser.add_argument("--video-expert-config", default=None)
+    parser.add_argument("--frozen-video-wan-fp32-strategy", default=None, choices=["true", "false"])
+    parser.add_argument("--lidar-wan-fp32-strategy", default=None, choices=["true", "false"])
     parser.add_argument("--lidar-attention-backend", default=None, choices=["torch", "minimal_a2a"])
     parser.add_argument("--lidar-num-blocks", type=int, default=None)
     parser.add_argument("--cross-frame-rule", default=None, choices=["all", "same_step"])
     parser.add_argument("--video-kv-every-n-layers", type=int, default=None)
     parser.add_argument("--train-height", type=int, default=64)
-    parser.add_argument("--train-width", type=int, default=112)
+    parser.add_argument("--train-width", type=int, default=226)
     parser.add_argument("--allow-lidar-resize-for-smoke", action="store_true")
     parser.add_argument("--latent-frames", type=int, default=8)
     parser.add_argument("--lidar-tokenizer-repo", default="/root/workspace/Cosmos-Drive-Dreams/cosmos-transfer-lidargen")
@@ -118,8 +143,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downsample-method", default="scatter_min")
     parser.add_argument("--repeat-row", type=int, default=4)
     parser.add_argument("--repeat-col", type=int, default=1)
-    parser.add_argument("--lidar-crop-width", type=int, default=896)
-    parser.add_argument("--crop-mode", default="center", choices=["center", "left", "none"])
+    parser.add_argument(
+        "--lidar-crop-width",
+        type=int,
+        default=0,
+        help="Optional pre-tokenizer crop width. Default 0 keeps the full downsampled Waymo range map.",
+    )
+    parser.add_argument("--crop-mode", default="none", choices=["center", "left", "none"])
     parser.add_argument("--max-range", type=float, default=100.0)
     parser.add_argument("--min-range", type=float, default=5.0)
     parser.add_argument("--min-value", type=float, default=-1.0)
@@ -155,14 +185,45 @@ def _copy_ckpt_defaults(args: argparse.Namespace, ckpt: dict[str, Any]) -> None:
         args.cross_frame_rule = ckpt_args.get("cross_frame_rule", "all")
     if args.video_kv_every_n_layers is None:
         args.video_kv_every_n_layers = ckpt_args.get("video_kv_every_n_layers", 1)
+    if args.rf_convention is None:
+        args.rf_convention = checkpoint_rf_convention(ckpt)
+    if args.rf_shift is None:
+        args.rf_shift = float(ckpt_args.get("rf_shift", 5.0))
+    if args.rf_num_train_timesteps is None:
+        args.rf_num_train_timesteps = int(ckpt_args.get("rf_num_train_timesteps", 1000))
+    if args.frozen_video_wan_fp32_strategy is None:
+        args.frozen_video_wan_fp32_strategy = str(
+            ckpt_args.get("frozen_video_wan_fp32_strategy", False)
+        ).lower()
+    if args.lidar_wan_fp32_strategy is None:
+        args.lidar_wan_fp32_strategy = str(ckpt_args.get("lidar_wan_fp32_strategy", False)).lower()
     args.train_height = ckpt_args.get("train_height", args.train_height)
     args.train_width = ckpt_args.get("train_width", args.train_width)
     args.latent_frames = ckpt_args.get("latent_frames", args.latent_frames)
 
 
-def _build_dataset(args: argparse.Namespace) -> torch.utils.data.Dataset:
+def _parse_optional_bool_arg(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    raise ValueError(f"Expected one of ['true', 'false'], got {value!r}.")
+
+
+def _build_dataset(
+    args: argparse.Namespace,
+    *,
+    expected_lidar_contract: dict[str, Any],
+) -> torch.utils.data.Dataset:
     if args.paired_latent_cache_dir:
-        dataset = PairedLatentCacheDataset(args.paired_latent_cache_dir)
+        dataset = PairedLatentCacheDataset(
+            args.paired_latent_cache_dir,
+            precomputed_video_latent_dir=args.precomputed_video_latent_dir,
+            requested_lidar_contract=expected_lidar_contract,
+        )
     else:
         dataset = build_waymo_dataset(args)
     end = args.sample_index + args.num_samples
@@ -184,6 +245,13 @@ def _metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
     }
 
 
+def _atomic_torch_save(payload: dict[str, Any], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_name(f".{output_path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(output_path)
+
+
 @torch.no_grad()
 def _teacher_forced_denoise_eval(
     model: torch.nn.Module,
@@ -193,35 +261,66 @@ def _teacher_forced_denoise_eval(
     eval_t: float,
     amp_enabled: bool,
     video_conditioning_mode: str,
+    rf_convention: str,
+    rf_shift: float,
+    rf_num_train_timesteps: int,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     batch_size = clean_lidar.shape[0]
     device = clean_lidar.device
-    t = torch.full((batch_size,), float(eval_t), device=device).clamp(1e-4, 1.0 - 1e-4)
+    u = torch.full((batch_size,), float(eval_t), device=device, dtype=torch.float32).clamp(1e-4, 1.0 - 1e-4)
+    if rf_convention == "predict2":
+        lidar_timesteps = rf_discrete_timesteps(
+            u,
+            shift=rf_shift,
+            num_train_timesteps=rf_num_train_timesteps,
+        )
+        sigma = rf_sigmas_from_timesteps(
+            lidar_timesteps,
+            num_train_timesteps=rf_num_train_timesteps,
+        ).view(-1, 1, 1, 1, 1)
+    else:
+        lidar_timesteps = u
+        sigma = u.view(-1, 1, 1, 1, 1)
     video_noise = torch.randn_like(clean_video)
     lidar_noise = torch.randn_like(clean_lidar)
     if video_conditioning_mode == "clean":
         noisy_video = clean_video
-        video_t = torch.ones_like(t).clamp(1e-4, 1.0 - 1e-4)
+        video_timesteps = torch.zeros_like(lidar_timesteps) if rf_convention == "predict2" else torch.ones_like(u)
     else:
-        noisy_video = (1.0 - t.view(-1, 1, 1, 1, 1)) * video_noise + t.view(-1, 1, 1, 1, 1) * clean_video
-        video_t = t
-    noisy_lidar = (1.0 - t.view(-1, 1, 1, 1, 1)) * lidar_noise + t.view(-1, 1, 1, 1, 1) * clean_lidar
-    target_velocity = clean_lidar - lidar_noise
+        video_timesteps = lidar_timesteps
+        noisy_video, _ = make_rf_noisy_and_target(
+            clean_video,
+            video_noise,
+            video_timesteps,
+            convention=rf_convention,
+            num_train_timesteps=rf_num_train_timesteps,
+        )
+    noisy_lidar, target_velocity = make_rf_noisy_and_target(
+        clean_lidar,
+        lidar_noise,
+        lidar_timesteps,
+        convention=rf_convention,
+        num_train_timesteps=rf_num_train_timesteps,
+    )
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
         pred_velocity = model(
             noisy_video=noisy_video,
             noisy_lidar=noisy_lidar,
-            video_timesteps=video_t,
-            lidar_timesteps=t,
+            video_timesteps=video_timesteps,
+            lidar_timesteps=lidar_timesteps,
             return_video_pred=False,
         )["lidar_pred"]
-    denoised = noisy_lidar + (1.0 - t.view(-1, 1, 1, 1, 1)) * pred_velocity.float()
+    if rf_convention == "predict2":
+        denoised = noisy_lidar - sigma.to(device=noisy_lidar.device, dtype=noisy_lidar.dtype) * pred_velocity.float()
+    else:
+        denoised = noisy_lidar + (1.0 - sigma.to(device=noisy_lidar.device, dtype=noisy_lidar.dtype)) * pred_velocity.float()
     metric = {
         "velocity_mse": float(F.mse_loss(pred_velocity.float(), target_velocity.float()).item()),
         "velocity_mae": float((pred_velocity.float() - target_velocity.float()).abs().mean().item()),
         "denoised_mse": float(F.mse_loss(denoised.float(), clean_lidar.float()).item()),
         "denoised_mae": float((denoised.float() - clean_lidar.float()).abs().mean().item()),
-        "eval_t": float(t[0].item()),
+        "eval_t": float(u[0].item()),
+        "eval_sigma": float(sigma.flatten()[0].item()),
     }
     return denoised, metric
 
@@ -235,32 +334,124 @@ def _sample_lidar_latent(
     sample_steps: int,
     amp_enabled: bool,
     video_conditioning_mode: str,
-) -> torch.Tensor:
+    rf_convention: str,
+    rf_shift: float,
+    rf_num_train_timesteps: int,
+    save_intermediate_every: int = 0,
+    target_lidar: torch.Tensor | None = None,
+    intermediate_output_path: Path | None = None,
+    intermediate_metadata: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     batch_size = clean_video.shape[0]
     device = clean_video.device
     lidar = torch.randn(lidar_shape, device=device, dtype=torch.float32)
     video_noise = torch.randn_like(clean_video)
-    dt = 1.0 / float(sample_steps)
-    for step_idx in range(sample_steps):
-        t_value = min(max((step_idx + 0.5) / float(sample_steps), 1e-4), 1.0 - 1e-4)
-        t = torch.full((batch_size,), t_value, device=device)
-        if video_conditioning_mode == "clean":
-            noisy_video = clean_video
-            video_t = torch.ones_like(t).clamp(1e-4, 1.0 - 1e-4)
+    intermediate_records: list[dict[str, Any]] = []
+
+    if rf_convention == "predict2":
+        scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=rf_num_train_timesteps,
+            shift=1.0,
+            prediction_type="flow_prediction",
+            solver_order=2,
+        )
+        scheduler.set_timesteps(sample_steps, device=device, shift=rf_shift)
+        step_iter = list(enumerate(scheduler.timesteps))
+    else:
+        scheduler = None
+        dt = 1.0 / float(sample_steps)
+        step_iter = list(enumerate(torch.arange(sample_steps, device=device)))
+
+    for step_idx, timestep in step_iter:
+        if rf_convention == "predict2":
+            timestep_value = float(timestep.item())
+            sigma_value = float(scheduler.sigmas[step_idx].item()) if scheduler is not None else timestep_value
+            lidar_timesteps = torch.full((batch_size,), timestep_value, device=device, dtype=torch.float32)
+            if video_conditioning_mode == "clean":
+                noisy_video = clean_video
+                video_timesteps = torch.zeros_like(lidar_timesteps)
+            else:
+                video_timesteps = lidar_timesteps
+                sigma = rf_sigmas_from_timesteps(
+                    video_timesteps,
+                    num_train_timesteps=rf_num_train_timesteps,
+                ).view(-1, 1, 1, 1, 1)
+                noisy_video = sigma.to(dtype=clean_video.dtype) * video_noise + (
+                    1.0 - sigma.to(dtype=clean_video.dtype)
+                ) * clean_video
         else:
-            noisy_video = (1.0 - t.view(-1, 1, 1, 1, 1)) * video_noise + t.view(-1, 1, 1, 1, 1) * clean_video
-            video_t = t
+            t_value = min(max((step_idx + 0.5) / float(sample_steps), 1e-4), 1.0 - 1e-4)
+            sigma_value = t_value
+            timestep_value = t_value
+            lidar_timesteps = torch.full((batch_size,), t_value, device=device, dtype=torch.float32)
+            if video_conditioning_mode == "clean":
+                noisy_video = clean_video
+                video_timesteps = torch.ones_like(lidar_timesteps).clamp(1e-4, 1.0 - 1e-4)
+            else:
+                video_timesteps = lidar_timesteps
+                noisy_video, _ = make_rf_noisy_and_target(
+                    clean_video,
+                    video_noise,
+                    video_timesteps,
+                    convention=rf_convention,
+                    num_train_timesteps=rf_num_train_timesteps,
+                )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
             pred_velocity = model(
                 noisy_video=noisy_video,
                 noisy_lidar=lidar,
-                video_timesteps=video_t,
-                lidar_timesteps=t,
+                video_timesteps=video_timesteps,
+                lidar_timesteps=lidar_timesteps,
                 return_video_pred=False,
             )["lidar_pred"]
-        lidar = lidar + dt * pred_velocity.float()
-        print(f"[infer] sample_step={step_idx + 1}/{sample_steps} t={t_value:.4f}")
-    return lidar
+        if rf_convention == "predict2":
+            assert scheduler is not None
+            lidar = scheduler.step(pred_velocity.float(), timestep, lidar).prev_sample
+        else:
+            lidar = lidar + dt * pred_velocity.float()
+        step_num = step_idx + 1
+        step_metrics = None
+        should_save = save_intermediate_every > 0 and (step_num % save_intermediate_every == 0 or step_num == sample_steps)
+        if should_save:
+            if target_lidar is not None:
+                step_metrics = _metrics(lidar, target_lidar)
+            intermediate_records.append(
+                {
+                    "step": step_num,
+                    "t": float(timestep_value),
+                    "sigma": float(sigma_value),
+                    "metrics": step_metrics,
+                    "sampled_lidar_latent": lidar.detach().cpu().to(torch.float16),
+                }
+            )
+            if intermediate_output_path is not None:
+                _atomic_torch_save(
+                    {
+                        **(intermediate_metadata or {}),
+                        "records": intermediate_records,
+                    },
+                    intermediate_output_path,
+                )
+        if step_metrics is None:
+            print(
+                f"[infer] sample_step={step_num}/{sample_steps} t={timestep_value:.4f} "
+                f"sigma={sigma_value:.4f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[infer] sample_step={step_num}/{sample_steps} t={timestep_value:.4f} "
+                f"sigma={sigma_value:.4f} "
+                f"mse={step_metrics['mse']:.6f} mae={step_metrics['mae']:.6f}",
+                flush=True,
+            )
+            if intermediate_output_path is not None:
+                print(
+                    f"[infer] wrote intermediate_latents={intermediate_output_path} "
+                    f"records={len(intermediate_records)}",
+                    flush=True,
+                )
+    return lidar, intermediate_records
 
 
 def _as_uint8_grid(tensor: torch.Tensor, frames: int) -> np.ndarray:
@@ -278,22 +469,58 @@ def _as_uint8_grid(tensor: torch.Tensor, frames: int) -> np.ndarray:
     return np.concatenate(imgs, axis=1)
 
 
-def _save_preview_png(output_path: Path, decoded_gt: torch.Tensor, decoded_sample: torch.Tensor, decoded_denoised: torch.Tensor, frames: int) -> None:
-    rows = [
-        ("gt_tokenizer_recon", _as_uint8_grid(decoded_gt, frames)),
-        ("rf_sample", _as_uint8_grid(decoded_sample, frames)),
-        ("single_step_denoised", _as_uint8_grid(decoded_denoised, frames)),
-    ]
+def _save_labeled_preview_png(output_path: Path, rows: list[tuple[str, torch.Tensor]], frames: int) -> None:
+    rendered_rows = [(label, _as_uint8_grid(tensor, frames)) for label, tensor in rows]
     label_w = 220
-    row_h, row_w = rows[0][1].shape
-    canvas = Image.new("L", (label_w + row_w, row_h * len(rows)), color=0)
+    row_h, row_w = rendered_rows[0][1].shape
+    canvas = Image.new("L", (label_w + row_w, row_h * len(rendered_rows)), color=0)
     draw = ImageDraw.Draw(canvas)
-    for row_idx, (label, arr) in enumerate(rows):
+    for row_idx, (label, arr) in enumerate(rendered_rows):
         y = row_idx * row_h
         canvas.paste(Image.fromarray(arr, mode="L"), (label_w, y))
         draw.text((8, y + 8), label, fill=255)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
+
+
+def _save_preview_png(output_path: Path, decoded_gt: torch.Tensor, decoded_sample: torch.Tensor, decoded_denoised: torch.Tensor, frames: int) -> None:
+    _save_labeled_preview_png(
+        output_path,
+        [
+            ("gt_tokenizer_recon", decoded_gt),
+            ("rf_sample", decoded_sample),
+            ("single_step_denoised", decoded_denoised),
+        ],
+        frames,
+    )
+
+
+def _select_intermediate_preview_records(records: list[dict[str, Any]], max_rows: int) -> list[dict[str, Any]]:
+    if max_rows <= 0 or len(records) <= max_rows:
+        return records
+    indices = np.linspace(0, len(records) - 1, num=max_rows).round().astype(int).tolist()
+    selected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for idx in indices:
+        if idx not in seen:
+            selected.append(records[idx])
+            seen.add(idx)
+    return selected
+
+
+def _crop_decoded_video(decoded: torch.Tensor, crop_region: torch.Tensor | list[int] | None) -> torch.Tensor:
+    if crop_region is None:
+        return decoded
+    if isinstance(crop_region, torch.Tensor):
+        if crop_region.ndim == 2 and crop_region.shape[0] == 1:
+            crop_region = crop_region[0]
+        crop_region = crop_region.detach().cpu().tolist()
+    if len(crop_region) == 1 and isinstance(crop_region[0], (list, tuple)):
+        crop_region = crop_region[0]
+    if len(crop_region) != 6:
+        raise ValueError(f"Expected tokenizer crop_region length 6, got {crop_region}")
+    f1, y1, x1, f2, y2, x2 = [int(value) for value in crop_region]
+    return decoded[:, :, f1:f2, y1:y2, x1:x2].contiguous()
 
 
 @torch.no_grad()
@@ -304,20 +531,42 @@ def _decode_and_preview(
     gt_lidar: torch.Tensor,
     sampled_lidar: torch.Tensor,
     denoised_lidar: torch.Tensor,
+    exact_context_latent: torch.Tensor | None,
+    tokenizer_crop_region: torch.Tensor | list[int] | None,
     model: torch.nn.Module,
+    lidar_contract: dict[str, Any],
+    intermediate_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     model.to("cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    tokenizer_args = argparse.Namespace(**vars(args))
-    tokenizer_args.tokenizer_ckpt = args.lidar_tokenizer_ckpt
-    tokenizer_args.tokenizer_config = args.lidar_tokenizer_config
-    tokenizer_args.dtype = args.lidar_tokenizer_dtype
-    tokenizer = _load_tokenizer(tokenizer_args)
     dtype = getattr(torch, args.lidar_tokenizer_dtype)
-    gt_dec = tokenizer.decode(gt_lidar.to(device=args.device, dtype=dtype)).detach().cpu()
-    sample_dec = tokenizer.decode(sampled_lidar.to(device=args.device, dtype=dtype)).detach().cpu()
-    denoised_dec = tokenizer.decode(denoised_lidar.to(device=args.device, dtype=dtype)).detach().cpu()
+    decode_kwargs: dict[str, torch.Tensor] = {}
+    if lidar_contract["tokenizer"] == "wan2pt1":
+        tokenizer_args = argparse.Namespace(**vars(args))
+        tokenizer_args.num_frames = args.num_video_frames
+        tokenizer_args.dtype = args.lidar_tokenizer_dtype
+        tokenizer = load_wan_tokenizer(tokenizer_args)
+    else:
+        tokenizer_args = argparse.Namespace(**vars(args))
+        tokenizer_args.tokenizer_ckpt = args.lidar_tokenizer_ckpt
+        tokenizer_args.tokenizer_config = args.lidar_tokenizer_config
+        tokenizer_args.dtype = args.lidar_tokenizer_dtype
+        tokenizer = _load_tokenizer(tokenizer_args)
+        if exact_context_latent is not None:
+            decode_kwargs["exact_context_latent"] = exact_context_latent.to(device=args.device, dtype=dtype)
+    gt_dec = _crop_decoded_video(
+        tokenizer.decode(gt_lidar.to(device=args.device, dtype=dtype), **decode_kwargs).detach().cpu(),
+        tokenizer_crop_region,
+    )
+    sample_dec = _crop_decoded_video(
+        tokenizer.decode(sampled_lidar.to(device=args.device, dtype=dtype), **decode_kwargs).detach().cpu(),
+        tokenizer_crop_region,
+    )
+    denoised_dec = _crop_decoded_video(
+        tokenizer.decode(denoised_lidar.to(device=args.device, dtype=dtype), **decode_kwargs).detach().cpu(),
+        tokenizer_crop_region,
+    )
     decoded_path = output_dir / f"{sample_key}_decoded.pt"
     torch.save(
         {
@@ -329,20 +578,53 @@ def _decode_and_preview(
     )
     preview_path = output_dir / f"{sample_key}_preview.png"
     _save_preview_png(preview_path, gt_dec, sample_dec, denoised_dec, args.preview_frames)
-    return {"decoded_path": str(decoded_path), "preview_path": str(preview_path)}
+    paths = {"decoded_path": str(decoded_path), "preview_path": str(preview_path)}
+
+    if args.decode_intermediates and intermediate_records:
+        preview_records = _select_intermediate_preview_records(
+            intermediate_records,
+            args.max_intermediate_preview_rows,
+        )
+        rows: list[tuple[str, torch.Tensor]] = [("gt_tokenizer_recon", gt_dec)]
+        for record in preview_records:
+            step = int(record["step"])
+            if step == args.sample_steps:
+                decoded = sample_dec
+            else:
+                latent = record["sampled_lidar_latent"].to(device=args.device, dtype=dtype)
+                decoded = _crop_decoded_video(tokenizer.decode(latent, **decode_kwargs).detach().cpu(), tokenizer_crop_region)
+            rows.append((f"rf_step_{step:04d}", decoded))
+        rows.append(("single_step_denoised", denoised_dec))
+        intermediate_preview_path = output_dir / f"{sample_key}_intermediate_preview.png"
+        _save_labeled_preview_png(intermediate_preview_path, rows, args.preview_frames)
+        paths["intermediate_preview_path"] = str(intermediate_preview_path)
+    return paths
 
 
 def main() -> None:
     args = parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
         args.device = "cpu"
-    if not args.allow_lidar_resize_for_smoke and (args.train_height, args.train_width) != NORMAL_LIDAR_LATENT_HW:
-        raise ValueError(f"Expected normal LiDAR latent size {NORMAL_LIDAR_LATENT_HW}, got {(args.train_height, args.train_width)}")
 
     configure_sdpa_backends(args.sdpa_backends)
     torch.manual_seed(args.seed)
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     _copy_ckpt_defaults(args, ckpt)
+    if "lidar_latent_contract" not in ckpt:
+        raise ValueError(f"{args.checkpoint} is missing lidar_latent_contract metadata.")
+    active_lidar_contract = normalize_lidar_latent_contract(ckpt["lidar_latent_contract"], source=args.checkpoint)
+    assert_checkpoint_lidar_contract(
+        ckpt,
+        checkpoint_path=Path(args.checkpoint),
+        expected_contract=active_lidar_contract,
+    )
+    args.train_height, args.train_width = lidar_latent_hw(active_lidar_contract)
+    if active_lidar_contract["version"] != OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT["version"] and not args.paired_latent_cache_dir:
+        raise ValueError(
+            f"Checkpoint uses LiDAR contract {active_lidar_contract['version']}; "
+            "online LiDAR encoding currently supports only the official S3/LTCV contract. "
+            "Pass --paired-latent-cache-dir for Wan2.1 LiDAR latent inference."
+        )
     ckpt_step = int(ckpt["step"])
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir(args, ckpt_step)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -351,10 +633,16 @@ def main() -> None:
     print(f"[infer] output_dir={output_dir}")
     print(
         f"[infer] split={args.split} sample_index={args.sample_index} num_samples={args.num_samples} "
-        f"sample_steps={args.sample_steps} video_conditioning_mode={args.video_conditioning_mode}"
+        f"sample_steps={args.sample_steps} video_conditioning_mode={args.video_conditioning_mode} "
+        f"rf_convention={args.rf_convention} rf_shift={args.rf_shift}"
     )
 
-    dataset = _build_dataset(args)
+    print(
+        f"[infer] lidar_latent_contract={active_lidar_contract['version']} "
+        f"lidar_latent_shape={tuple(active_lidar_contract['latent_shape'])}"
+    )
+
+    dataset = _build_dataset(args, expected_lidar_contract=active_lidar_contract)
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -379,6 +667,8 @@ def main() -> None:
         lidar_num_blocks=args.lidar_num_blocks,
         video_kv_every_n_layers=args.video_kv_every_n_layers,
         checkpoint_lidar_blocks=False,
+        frozen_video_use_wan_fp32_strategy=_parse_optional_bool_arg(args.frozen_video_wan_fp32_strategy),
+        lidar_use_wan_fp32_strategy=_parse_optional_bool_arg(args.lidar_wan_fp32_strategy),
         policy=VideoLidarAttentionPolicy(mode="video_to_lidar", cross_frame_rule=args.cross_frame_rule),
     )
     model.lidar_expert.load_state_dict(ckpt["lidar_expert"], strict=True)
@@ -392,13 +682,21 @@ def main() -> None:
             if args.paired_latent_cache_dir:
                 clean_video = batch["video_latent"].to(device=args.device, dtype=torch.float32)
                 clean_lidar = batch["lidar_latent"].to(device=args.device, dtype=torch.float32)
+                exact_context_latent = batch.get("exact_context_latent")
+                tokenizer_crop_region = batch.get("tokenizer_crop_region")
+                if exact_context_latent is not None:
+                    exact_context_latent = exact_context_latent.to(device=args.device, dtype=torch.float32)
             else:
                 assert video_encoder is not None and lidar_encoder is not None
                 clean_video = video_encoder.encode(batch["video"]).to(device=args.device, dtype=torch.float32)
-                clean_lidar = lidar_encoder.encode_batch(
+                clean_lidar, exact_context_latent, tokenizer_crop_region = lidar_encoder.encode_batch(
                     batch["waymo_segment_key"],
                     batch["waymo_lidar_frame_indices"],
-                ).to(device=args.device, dtype=torch.float32)
+                    return_exact_context=True,
+                    return_crop_region=True,
+                )
+                clean_lidar = clean_lidar.to(device=args.device, dtype=torch.float32)
+                exact_context_latent = exact_context_latent.to(device=args.device, dtype=torch.float32)
                 clean_lidar = maybe_resize_lidar(
                     clean_lidar,
                     args.train_height,
@@ -417,14 +715,36 @@ def main() -> None:
             eval_t=args.eval_t,
             amp_enabled=amp_enabled,
             video_conditioning_mode=args.video_conditioning_mode,
+            rf_convention=args.rf_convention,
+            rf_shift=args.rf_shift,
+            rf_num_train_timesteps=args.rf_num_train_timesteps,
         )
-        sampled = _sample_lidar_latent(
+        intermediate_path = None
+        if args.save_intermediate_every > 0:
+            intermediate_path = output_dir / f"{sample_key}_intermediate_latents.pt"
+        sampled, intermediate_records = _sample_lidar_latent(
             model,
             clean_video,
             lidar_shape=tuple(clean_lidar.shape),
             sample_steps=args.sample_steps,
             amp_enabled=amp_enabled,
             video_conditioning_mode=args.video_conditioning_mode,
+            rf_convention=args.rf_convention,
+            rf_shift=args.rf_shift,
+            rf_num_train_timesteps=args.rf_num_train_timesteps,
+            save_intermediate_every=args.save_intermediate_every,
+            target_lidar=clean_lidar,
+            intermediate_output_path=intermediate_path,
+            intermediate_metadata={
+                "sample_key": sample_key,
+                "checkpoint": args.checkpoint,
+                "checkpoint_step": ckpt_step,
+                "sample_steps": args.sample_steps,
+                "save_intermediate_every": args.save_intermediate_every,
+                "rf_convention": args.rf_convention,
+                "rf_shift": args.rf_shift,
+                "rf_num_train_timesteps": args.rf_num_train_timesteps,
+            },
         )
         elapsed = time.perf_counter() - start
         sample_metrics = _metrics(sampled, clean_lidar)
@@ -434,6 +754,9 @@ def main() -> None:
             "checkpoint_step": ckpt_step,
             "elapsed_sec": elapsed,
             "sample_steps": args.sample_steps,
+            "rf_convention": args.rf_convention,
+            "rf_shift": args.rf_shift,
+            "rf_num_train_timesteps": args.rf_num_train_timesteps,
             "sampled_vs_gt": sample_metrics,
             "single_step_vs_gt": denoised_latent_metrics,
             "denoise_velocity": denoise_metrics,
@@ -448,8 +771,43 @@ def main() -> None:
             "sampled_lidar_latent": sampled.detach().cpu().to(torch.float16),
             "single_step_denoised_lidar_latent": denoised.detach().cpu().to(torch.float16),
         }
+        if exact_context_latent is not None:
+            payload["exact_context_latent"] = exact_context_latent.detach().cpu().to(torch.float16)
+        if tokenizer_crop_region is not None:
+            payload["tokenizer_crop_region"] = (
+                tokenizer_crop_region.detach().cpu()
+                if isinstance(tokenizer_crop_region, torch.Tensor)
+                else torch.tensor(tokenizer_crop_region, dtype=torch.int64)
+            )
         if args.save_video_latent:
             payload["video_latent"] = clean_video.detach().cpu().to(torch.float16)
+
+        if intermediate_records:
+            if intermediate_path is None:
+                intermediate_path = output_dir / f"{sample_key}_intermediate_latents.pt"
+            if not intermediate_path.exists():
+                _atomic_torch_save(
+                    {
+                        "sample_key": sample_key,
+                        "checkpoint": args.checkpoint,
+                        "checkpoint_step": ckpt_step,
+                        "sample_steps": args.sample_steps,
+                        "save_intermediate_every": args.save_intermediate_every,
+                        "records": intermediate_records,
+                    },
+                    intermediate_path,
+                )
+            metrics["intermediate_latent_path"] = str(intermediate_path)
+            metrics["intermediate_steps"] = [int(record["step"]) for record in intermediate_records]
+            metrics["intermediate_metrics"] = [
+                {
+                    "step": int(record["step"]),
+                    "t": float(record["t"]),
+                    "sigma": float(record.get("sigma", record["t"])),
+                    "sampled_vs_gt": record["metrics"],
+                }
+                for record in intermediate_records
+            ]
 
         if args.decode_lidar:
             decode_paths = _decode_and_preview(
@@ -459,7 +817,11 @@ def main() -> None:
                 clean_lidar,
                 sampled,
                 denoised,
+                exact_context_latent,
+                tokenizer_crop_region,
                 model,
+                active_lidar_contract,
+                intermediate_records,
             )
             metrics.update(decode_paths)
             payload["decode_paths"] = decode_paths
@@ -488,6 +850,8 @@ def main() -> None:
                 lidar_num_blocks=args.lidar_num_blocks,
                 video_kv_every_n_layers=args.video_kv_every_n_layers,
                 checkpoint_lidar_blocks=False,
+                frozen_video_use_wan_fp32_strategy=_parse_optional_bool_arg(args.frozen_video_wan_fp32_strategy),
+                lidar_use_wan_fp32_strategy=_parse_optional_bool_arg(args.lidar_wan_fp32_strategy),
                 policy=VideoLidarAttentionPolicy(mode="video_to_lidar", cross_frame_rule=args.cross_frame_rule),
             )
             model.lidar_expert.load_state_dict(ckpt["lidar_expert"], strict=True)

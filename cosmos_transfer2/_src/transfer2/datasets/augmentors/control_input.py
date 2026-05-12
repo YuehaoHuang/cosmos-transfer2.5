@@ -534,6 +534,25 @@ class AddControlInputHdmapBbox(Augmentor):
         return data_dict
 
 
+class AddControlInputRangemapLayout(Augmentor):
+    """Use a precomputed LiDAR range-map layout video as control input."""
+
+    def __init__(
+        self,
+        input_keys: list,
+        output_keys: Optional[list] = ["control_input_rangemap_layout"],
+        args: Optional[dict] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(input_keys, output_keys, args)
+
+    def __call__(self, data_dict: dict) -> dict:
+        if "control_input_rangemap_layout" in data_dict:
+            return data_dict
+        data_dict[self.output_keys[0]] = data_dict[self.input_keys[0]]
+        return data_dict
+
+
 CTRL_HINT_KEYS = {
     "control_input_edge": AddControlInputEdge,
     "control_input_vis": AddControlInputBlur,
@@ -541,6 +560,7 @@ CTRL_HINT_KEYS = {
     "control_input_seg": AddControlInputSeg,
     "control_input_inpaint": AddControlInputIdentity,
     "control_input_hdmap_bbox": AddControlInputHdmapBbox,
+    "control_input_rangemap_layout": AddControlInputRangemapLayout,
 }
 
 

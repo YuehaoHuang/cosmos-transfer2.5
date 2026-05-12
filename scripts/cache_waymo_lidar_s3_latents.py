@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 
@@ -46,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--sample-key", action="append", default=None, help="Exact video sample key without .pt.")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--pad-last", action="store_true")
     parser.add_argument("--lidar-chunk-stride-frames", type=int, default=10)
@@ -56,8 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downsample-method", default="scatter_min")
     parser.add_argument("--repeat-row", type=int, default=4)
     parser.add_argument("--repeat-col", type=int, default=1)
-    parser.add_argument("--lidar-crop-width", type=int, default=896)
-    parser.add_argument("--crop-mode", default="center", choices=["center", "left", "none"])
+    parser.add_argument(
+        "--lidar-crop-width",
+        type=int,
+        default=0,
+        help="Optional pre-tokenizer crop width. Default 0 keeps the full downsampled Waymo range map.",
+    )
+    parser.add_argument("--crop-mode", default="none", choices=["center", "left", "none"])
     parser.add_argument("--max-range", type=float, default=100.0)
     parser.add_argument("--min-range", type=float, default=5.0)
     parser.add_argument("--min-value", type=float, default=-1.0)
@@ -98,11 +106,24 @@ def _split_sample_key(sample_key: str) -> tuple[str, int]:
         raise ValueError(f"Expected sample key '<segment_key>_<chunk_idx>', got {sample_key!r}") from exc
 
 
-def _iter_sample_keys(video_latent_dir: Path, sample_keys: list[str] | None, max_samples: int | None) -> list[str]:
+def _iter_sample_keys(
+    video_latent_dir: Path,
+    sample_keys: list[str] | None,
+    max_samples: int | None,
+    *,
+    num_shards: int = 1,
+    shard_index: int = 0,
+) -> list[str]:
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"shard_index must be in [0, {num_shards}), got {shard_index}")
     if sample_keys:
         keys = sample_keys
     else:
         keys = [path.stem for path in sorted(video_latent_dir.glob("*.pt"))]
+    if num_shards > 1:
+        keys = keys[shard_index::num_shards]
     if max_samples is not None:
         keys = keys[:max_samples]
     return keys
@@ -190,6 +211,77 @@ def _load_tokenizer(args: argparse.Namespace) -> torch.nn.Module:
     return model.to(dtype=getattr(torch, args.dtype)).eval()
 
 
+def _compute_video_crop_region(num_frames: int, height: int, width: int, *, temporal_align: int = 1, spatial_align: int = 16) -> list[int]:
+    frames_to_pad = (temporal_align - (num_frames - 1) % temporal_align) if (num_frames - 1) % temporal_align != 0 else 0
+    height_to_pad = (spatial_align - height % spatial_align) if height % spatial_align != 0 else 0
+    width_to_pad = (spatial_align - width % spatial_align) if width % spatial_align != 0 else 0
+    return [
+        frames_to_pad >> 1,
+        height_to_pad >> 1,
+        width_to_pad >> 1,
+        num_frames + (frames_to_pad >> 1),
+        height + (height_to_pad >> 1),
+        width + (width_to_pad >> 1),
+    ]
+
+
+def _pad_video_input_tensor(
+    input_tensor: torch.Tensor,
+    *,
+    temporal_align: int = 1,
+    spatial_align: int = 16,
+) -> tuple[torch.Tensor, list[int]]:
+    if input_tensor.ndim != 5:
+        raise ValueError(f"Expected input_tensor rank 5 [B,C,T,H,W], got {tuple(input_tensor.shape)}")
+    num_frames = int(input_tensor.shape[2])
+    height = int(input_tensor.shape[3])
+    width = int(input_tensor.shape[4])
+    crop_region = _compute_video_crop_region(
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        temporal_align=temporal_align,
+        spatial_align=spatial_align,
+    )
+    f1, y1, x1, f2, y2, x2 = crop_region
+    pad_frames = (f1, f2 - num_frames)
+    pad_height = (y1, y2 - height)
+    pad_width = (x1, x2 - width)
+
+    padded = input_tensor
+    if pad_height != (0, 0) or pad_width != (0, 0):
+        padded = F.pad(
+            padded,
+            (pad_width[0], pad_width[1], pad_height[0], pad_height[1]),
+            mode="constant",
+            value=0.0,
+        )
+    if pad_frames != (0, 0):
+        padded = F.pad(padded, (0, 0, 0, 0, pad_frames[0], pad_frames[1]), mode="replicate")
+    return padded.contiguous(), crop_region
+
+
+@torch.no_grad()
+def _extract_official_ltcv_latent(
+    tokenizer: torch.nn.Module,
+    input_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None, list[int], list[int]]:
+    padded_input_tensor, crop_region = _pad_video_input_tensor(input_tensor, temporal_align=1, spatial_align=16)
+    if (
+        hasattr(tokenizer, "_encode_video_to_target_latents")
+        and hasattr(tokenizer, "temporal_compressor")
+        and hasattr(tokenizer, "exact_context_frames")
+    ):
+        target_latents = tokenizer._encode_video_to_target_latents(padded_input_tensor)
+        compressed_latent, _ = tokenizer.temporal_compressor.encode(target_latents)
+        exact_context_latent = target_latents[:, :, : int(tokenizer.exact_context_frames), :, :]
+        return compressed_latent, exact_context_latent, crop_region, list(padded_input_tensor.shape[2:])
+
+    encoded = tokenizer.encode(padded_input_tensor)
+    latent = encoded[0] if isinstance(encoded, tuple) else encoded
+    return latent, None, crop_region, list(padded_input_tensor.shape[2:])
+
+
 def _save_latent(output_path: Path, payload: dict[str, Any], overwrite: bool) -> None:
     if output_path.exists() and not overwrite:
         return
@@ -212,12 +304,18 @@ def main() -> None:
     video_latent_dir = Path(args.video_latent_dir)
     raw_lidar_dir = Path(args.raw_lidar_root) / args.split / "lidar"
     output_dir = Path(args.output_dir)
-    sample_keys = _iter_sample_keys(video_latent_dir, args.sample_key, args.max_samples)
+    sample_keys = _iter_sample_keys(
+        video_latent_dir,
+        args.sample_key,
+        args.max_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+    )
 
     print(f"[cache] video_latent_dir={video_latent_dir}")
     print(f"[cache] raw_lidar_dir={raw_lidar_dir}")
     print(f"[cache] output_dir={output_dir}")
-    print(f"[cache] num_sample_keys={len(sample_keys)}")
+    print(f"[cache] shard={args.shard_index}/{args.num_shards} num_sample_keys={len(sample_keys)}")
 
     tokenizer = _load_tokenizer(args)
     save_dtype = getattr(torch, args.save_dtype)
@@ -243,9 +341,13 @@ def main() -> None:
             range_maps, selected_frame_names = _load_lidar_window(tar_path, frame_indices, pad_last=args.pad_last)
             input_tensor = _preprocess_range_maps(range_maps, args).to(device=args.device, dtype=getattr(torch, args.dtype))
             with torch.no_grad():
-                encoded = tokenizer.encode(input_tensor)
-                latent = encoded[0] if isinstance(encoded, tuple) else encoded
+                latent, exact_context_latent, crop_region, tokenizer_input_shape = _extract_official_ltcv_latent(
+                    tokenizer,
+                    input_tensor,
+                )
             latent = latent.detach().cpu().to(dtype=save_dtype)
+            if exact_context_latent is not None:
+                exact_context_latent = exact_context_latent.detach().cpu().to(dtype=save_dtype)
         except Exception as exc:  # keep long cache jobs moving across bad clips
             print(f"[cache][skip] {sample_key}: {exc}")
             skipped += 1
@@ -259,6 +361,13 @@ def main() -> None:
             "lidar_frame_indices": frame_indices,
             "lidar_frame_names": selected_frame_names,
             "source_tar": str(tar_path),
+            "lidar_tokenizer_ckpt": args.tokenizer_ckpt,
+            "lidar_tokenizer_config": args.tokenizer_config,
+            "exact_context_latent": None if exact_context_latent is None else exact_context_latent.squeeze(0),
+            "tokenizer_crop_region": crop_region,
+            "tokenizer_latent_kind": "compressed_latent_from_encoder" if exact_context_latent is not None else "encode_output",
+            "preprocessed_input_shape": list(input_tensor.shape[2:]),
+            "tokenizer_input_shape": tokenizer_input_shape,
             "preprocess": {
                 "downsample_factor_row": args.downsample_factor_row,
                 "downsample_factor_col": args.downsample_factor_col,
@@ -274,7 +383,11 @@ def main() -> None:
         }
         _save_latent(output_path, payload, overwrite=True)
         written += 1
-        print(f"[cache][write] {output_path} latent_shape={tuple(payload['latent'].shape)}")
+        exact_shape = None if payload["exact_context_latent"] is None else tuple(payload["exact_context_latent"].shape)
+        print(
+            f"[cache][write] {output_path} latent_shape={tuple(payload['latent'].shape)} "
+            f"exact_context_shape={exact_shape} crop_region={payload['tokenizer_crop_region']}"
+        )
 
     print(f"[cache] done written={written} skipped={skipped}")
 

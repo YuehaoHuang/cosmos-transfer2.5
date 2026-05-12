@@ -50,6 +50,7 @@ class ControlVideo2WorldCondition(Video2WorldCondition):
     control_input_seg_mask: Optional[torch.Tensor] = None
     control_input_inpaint_mask: Optional[torch.Tensor] = None
     control_input_hdmap_bbox: Optional[torch.Tensor] = None
+    control_input_rangemap_layout: Optional[torch.Tensor] = None
     latent_control_input: Optional[torch.Tensor] = None
     control_context_scale: Optional[float] = 1.0
 
@@ -358,6 +359,13 @@ _SHARED_CONFIG_AV.pop("control_input_seg_mask")
 _SHARED_CONFIG_AV["control_input_hdmap_bbox"] = L(ReMapkey)(
     input_key="control_input_hdmap_bbox",
     output_key="control_input_hdmap_bbox",
+    dropout_rate=0.0,
+    dtype=None,
+)
+
+_SHARED_CONFIG["control_input_rangemap_layout"] = L(ReMapkey)(
+    input_key="control_input_rangemap_layout",
+    output_key="control_input_rangemap_layout",
     dropout_rate=0.0,
     dtype=None,
 )

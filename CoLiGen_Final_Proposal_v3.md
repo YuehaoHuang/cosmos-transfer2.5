@@ -2,10 +2,10 @@
 
 > **Target Venue**: NeurIPS 2026 Main Track
 > **Official Submission Milestones**: Abstract due May 4, 2026 (AOE); Full paper due May 6, 2026 (AOE)
-> **Today / Remaining Time**: April 19, 2026 -> 15 days to abstract, 17 days to full paper
+> **Today / Remaining Time**: May 5, 2026 -> abstract deadline passed; 1 day to full paper deadline
 > **Backbone**: Cosmos Transfer 2.5 - 2B Rectified Flow DiT
 > **Hardware Budget**: 8 x NVIDIA A100-80GB (single node)
-> **Proposal Status**: Progress-updated revision v4.6（one-way expert baseline 8-GPU 续训至 5k 中）
+> **Proposal Status**: Progress-updated revision v4.7（full 28-block one-way baseline 已停训；当前 best candidate 为 step_005000）
 
 ### 已完成里程碑（2026-04-18 状态快照）
 
@@ -180,19 +180,19 @@ Condition C
 | 时间压缩率 | **4x** (`29→8`) | **4x** (`29→8`)，首帧 bypass 保留 |
 | 空间压缩率 | 8x8 | 8x8 |
 | 29 像素帧 → latent 时间维度 | `state_t = (29-1)/4+1 = 8` | **`state_t = 8`（同时钟）** |
-| 单帧空间输入 | 720p (~`720×1280`) | `512 x 896`（Waymo TOP range map） |
+| 单帧空间输入 | 720p (~`720×1280`) | `512 x 1800`（Waymo TOP range map，raw `3600` 先按列 `scatter_min` 下采样 2x） |
 | 通道数 | 16 | 16 |
 | 部署 checkpoint | `waymo_5cam_post_train/iter_000033000` | `OpenSora-S3/iter_000035500.pt` |
 
 **新的关键设计约束：**
 
 1. **时间维度**：两个模态都是 `state_t=8`，无需 temporal adapter；但不把 LiDAR 当作第 6 个 camera 直接塞进现有 video grid。
-2. **空间维度**：video 是 `(H_v/8, W_v/8)`（720p → 90×160），LiDAR range map 是 `(512/8, 896/8) = (64, 112)`。空间网格不同，因此采用 FastWAM-inspired 的独立 expert / token stream，再用 attention policy 和 GALA sparse mask 建立跨模态对应。
+2. **空间维度**：video 是 `(H_v/8, W_v/8)`（720p → 90×160），LiDAR range map 走 tokenizer 正式预处理后得到 `128×3600 -> 512×1800`。2026-04-21 已按官方 `lidar_cli.py` / LTCV 路径核对：真正送入 tokenizer 的输入会先做 spatial pad，`512×1800 -> 512×1808`，压到 **`latent (64,226)`**；decode 时还必须带 `exact_context_latent` 再按 `crop_region=[0,0,4,29,512,1804]` 裁回 `1800`。不能再像之前那样在 tokenizer encode 前裁成 `1792` 或 `896`，否则 target latent decode 会显著劣化。空间网格不同，因此采用 FastWAM-inspired 的独立 expert / token stream，再用 attention policy 和 GALA sparse mask 建立跨模态对应。
 3. **通道维度**：假设两者都是 16 通道（需验证 S3 config），若不一致，用 1x1 Conv 做轻量通道投影；如果一致则零参数对齐。
 
 **方案**：**FastWAM-inspired 双 expert 同步去噪，无 temporal adapter**。
 - Video expert：保留现有 `MultiViewDiT / MultiViewControlDiT`，video token 序列仍是 `B × C × (V × 8) × H_v/8 × W_v/8`，`V=5` 视角
-- LiDAR expert：新增独立 LiDAR token stream，输入 `B × C × 8 × 64 × 112`
+- LiDAR expert：新增独立 LiDAR token stream，输入 `B × C × 8 × 64 × 226`
 - 默认 baseline 采用 `video -> LiDAR` one-way attention：LiDAR query 可以看 video K/V，video query 不看 LiDAR，保证旧 video 生成路径不被 LiDAR 改写
 - 主方法在 selected layers 上加入 GALA sparse gated interaction；双向分支使用 zero-init gate，只在 joint config 显式开启
 
@@ -217,7 +217,7 @@ Condition C
 项目环境：
 
 ```bash
-conda activate cosmos-transfer2.5
+conda activate cosmos-transfer2.5-merge
 ```
 
 当前 baseline 不再默认依赖离线 video latent / LiDAR latent cache，而是以 `WaymoMultiviewDataset` 为主时钟在线取样：
@@ -242,7 +242,9 @@ python scripts/train_waymo_video_to_lidar_baseline.py \
   --device cuda
 ```
 
-LiDAR baseline 必须使用正常 S3 latent 尺寸 `64x112`；脚本默认会拒绝非 `64x112` 的 `--train-height/--train-width`，除非显式加 `--allow-lidar-resize-for-smoke` 做本地非 baseline smoke。当前已验证输出：`video_latent=(1,16,40,90,160)`，`lidar_latent=(1,16,8,64,112)`。可选 cache 工具 `scripts/cache_waymo_lidar_s3_latents.py` 只作为加速/复现实验的写回路径，不是 baseline 的默认依赖。
+LiDAR baseline 必须使用官方在线提取核对过的 S3 latent 尺寸 `64x226`；主线做法不是 pre-tokenizer 裁剪，而是保留 full-width `1800` 输入，让 tokenizer 自己 pad 到 `1808`，保存 `compressed_latent_from_encoder`，并额外保存 `exact_context_latent=(16,1,64,226)` 供 decode 使用。脚本默认会拒绝非 `64x226` 的 `--train-height/--train-width`，除非显式加 `--allow-lidar-resize-for-smoke` 做本地非 baseline smoke。当前应验证输出：`video_latent=(1,16,40,90,160)`，`lidar_latent=(1,16,8,64,226)`。可选 cache 工具 `scripts/cache_waymo_lidar_s3_latents.py` 只作为加速/复现实验的写回路径，不是 baseline 的默认依赖。
+
+2026-04-26 更新：完整 one-way expert 主线已切到真实 video latent + 在线 Wan2.1 LiDAR VAE。video latent 读取 `/data/waymo/chunk/training/samples` 的真实 Wan latent；LiDAR 仍由同一个 Waymo dataloader 的 `waymo_lidar_frame_indices` 在线读取 raw tar，并用 `docs/waymo_lidar_wan21_vae_preprocessing.md` 的置顶方案 encode 成 `lidar_latent=(B,16,8,88,164)`。入口脚本为 `train_waymo_video_lidar_one_way_wan21_online.sh`。2026-04-29 起默认改为 `LIDAR_NUM_BLOCKS=28`、`VIDEO_KV_EVERY_N_LAYERS=4`、`CHECKPOINT_LIDAR_BLOCKS=true`、`INIT_LIDAR_FROM_VIDEO=true`。
 
 #### 4.2.2.2 One-way expert baseline（2026-04-18 已启动 8-GPU 训练）
 
@@ -262,7 +264,7 @@ LiDAR baseline 必须使用正常 S3 latent 尺寸 `64x112`；脚本默认会拒
 
 2026-04-18 当天状态：
 
-- dummy forward 已通过：`video_pred=(1,16,40,90,160)`，`lidar_pred=(1,16,8,64,112)`
+- 当前 one-way expert 主线默认尺寸已切到：`video_pred=(1,16,40,90,160)`，`lidar_pred=(1,16,8,64,226)`
 - 单卡 1-step smoke 已通过并保存 checkpoint：`/data2/waymo_video_lidar_one_way_expert/smoke_20260418_201246/checkpoints/step_000001.pt`，loss=5.03
 - 正式 8-GPU baseline 已通过 `tmux` 启动（首次 bs=1 显存仅 ~37GB，已重启为 bs=2 → ~51GB / 80GB / GPU）：
   - session：`one_way_expert_v2l_20260418_202505`
@@ -287,7 +289,8 @@ LiDAR expert 不是轻量 LoRA / 小 adapter，而是与 frozen video DiT 主干
 | `adaln_lora_dim` | 256 | AdaLN-LoRA 调制 |
 | `pos_emb_cls` | rope3d | 同 video DiT |
 | `crossattn_proj_in_channels → crossattn_emb_channels` | 100352 → 1024 | T5 文本投影；当前训练注入 null embedding，待接 caption |
-| 输入 latent | `(B, 16, 8, 64, 112)` | state_t=8，与 video latent 时钟对齐 |
+| 输入 latent | `(B, 16, 8, 64, 226)` | state_t=8，与 video latent 时钟对齐；full-width `1800` 输入经官方 spatial pad 到 `1808` 后得到 |
+| decode 额外上下文 | `(B, 16, 1, 64, 226)` | `exact_context_latent`；LTCV decode 必须一并传入，之后再按 `crop_region` 裁回 `1800` |
 | `timestep_scale / use_wan_fp32_strategy` | 0.001 / True | 与 video DiT 一致 |
 | Attention policy | `mode=video_to_lidar`，默认 `cross_frame_rule=all`；可切 `same_step` | `all` 让 LiDAR Q 读全部 video K/V，主线吞吐更稳；`same_step` 已向量化为单层 1 次 SDPA，恢复严格逐 step 对齐且可走 FlashAttention |
 | 每层 forward | `_forward_one_way_block`：mixed self-attn → cross-attn(text) → MLP | 训练时整层包 `torch.utils.checkpoint`，节省 activation 显存 |
@@ -305,6 +308,7 @@ LiDAR expert 不是轻量 LoRA / 小 adapter，而是与 frozen video DiT 主干
 - deadline baseline 加速开关：新增 `--lidar-num-blocks N`。`N=14` 单卡 smoke 已通过，step time 从 full 28-block 的约 `49.15s` 降到 `28.55s`；下一步优先跑 14-block 8-GPU/可用 GPU 短训，而不是继续只调 Flash backend。
 - 进一步用显存换时间：新增 `--no-checkpoint-lidar-blocks` 与 `--no-empty-cache-after-encode`。`N=14 + flash_only + no checkpoint + no empty_cache` 单卡 smoke 为 `25.31s/step`，比 14-block checkpoint 版再快约 11%。若 7/8-GPU 显存允许，deadline 版优先使用这组。
 - 多卡实测：机器重启后当前只枚举到 7 张 A100；`N=14 + batch_size_per_rank=2 + checkpoint_lidar_blocks=True + no_empty_cache + no_offload` 可稳定跑，显存约 `42.5GB/GPU`，step 2-5 稳态约 `53.7-55.6s/step`，loss `5.35 -> 2.93` 健康下降。`N=14 + no_checkpoint + batch_size_per_rank=2` 会 OOM（~79GB/GPU），不作为稳定配置。
+- Wan2.1 在线 VAE 实测：`N=14 + video_kv_every_n_layers=4 + no_checkpoint + batch_size_per_rank=1` 单卡 smoke 通过，但 7-GPU DDP 首个 forward 峰值约 `77GB/GPU` 后再申请 `2.2GB` 导致 OOM；当前稳定运行改为 `CHECKPOINT_LIDAR_BLOCKS=true`，显存约 `30.6GB/GPU`，tmux session `wan21_online_train_20260426_004355`。
 
 后续可调维度（若要压参数量或显存）：缩 `num_blocks` / `model_channels`；或把 LiDAR expert 改为 LoRA-only 训练 + 全冻结 backbone clone。**当前默认按"2B 级 LiDAR expert"路线训，与 proposal §4.2.2 FastWAM-inspired 双 expert 设计一致。**
 
@@ -486,7 +490,7 @@ $$
 因为 LiDAR tokenizer 已完成 3D `29→8→29` 升级、video 后训练已有可用 checkpoint，剩余工作再次收窄：
 
 1. **LiDAR latent 同步在线提取 / 缓存**（~1 天）
-   不能再用独立 LiDAR sampler 随机抽窗后离线落盘；必须以 Waymo video 后训练 dataloader 的 `sample_key` 和窗口为准。当前视频样本名是 `<segment_key>_<chunk_idx>`，5 个 camera 与 world_scenario control 都读取该 29-frame chunk 的本地 `[0, 29)`；对应 LiDAR tar / metadata 则按 `<segment_key>` 命名。LiDAR 输入窗口应由 `chunk_idx` 反推：默认 `lidar_start = chunk_idx * 10 + local_frame_start`，取连续 29 帧后用 OpenSora-S3 `iter_000035500.pt` 在线 no-grad encode，得到 `[B, 16, 8, 64, 112]`。稳定后可以把结果按完整 `sample_key=<segment_key>_<chunk_idx>` 写 cache，但 cache 只能由同一个 Waymo dataloader 生成。
+   不能再用独立 LiDAR sampler 随机抽窗后离线落盘；必须以 Waymo video 后训练 dataloader 的 `sample_key` 和窗口为准。当前视频样本名是 `<segment_key>_<chunk_idx>`，5 个 camera 与 world_scenario control 都读取该 29-frame chunk 的本地 `[0, 29)`；对应 LiDAR tar / metadata 则按 `<segment_key>` 命名。LiDAR 输入窗口应由 `chunk_idx` 反推：默认 `lidar_start = chunk_idx * 10 + local_frame_start`，取连续 29 帧后用 OpenSora-S3 `iter_000035500.pt` 在线 no-grad encode；主线保留 full-width `1800` 输入，让 tokenizer 官方 pad 到 `1808`，保存 `compressed_latent_from_encoder -> [B, 16, 8, 64, 226]`，并同步写下 `exact_context_latent -> [B, 16, 1, 64, 226]` 与 `tokenizer_crop_region`。稳定后可以把结果按完整 `sample_key=<segment_key>_<chunk_idx>` 写 cache，但 cache 只能由同一个 Waymo dataloader 生成。
 
 2. **FastWAM-inspired joint policy / LiDAR expert scaffold**（~1 天）
    新增独立 LiDAR token stream 与 attention policy，默认 `video_to_lidar` one-way：LiDAR query 读 video K/V，video query 不读 LiDAR。当前 helper 已放在 `video_lidar_joint_policy.py`，后续 joint config 显式 import；默认 video generation / video post-training 不受影响。
@@ -748,7 +752,7 @@ $$
 [已检查] one-way expert baseline 主训练 run：session `one_way_expert_lidar14_b1_no_lidar_ckpt_main_7gpu_20260419_004808`，输出 `/data2/waymo_video_lidar_one_way_expert/one_way_expert_lidar14_b1_no_lidar_ckpt_main_7gpu_20260419_004808`。日志到 step 1830 后停止，末尾无 traceback、无 `[train] done`；最后文件时间为 `2026-04-19 13:07:59 CST`。loss 从 `5.37` 降到 `0.48`，最后 50 个 log 点均值 `0.509`，稳态 `~24.1s/step`。当前唯一可用保存点是 `checkpoints/step_001000.pt`。
 [已完成] step1000 推理 smoke：新增 `scripts/infer_waymo_video_lidar_one_way_expert.py`。validation sample `10203656353524179475_7625_000_7645_000_0` 上，teacher-forced 单步 denoise 已贴近 GT tokenizer recon（latent MSE `0.123`，MAE `0.248`）；完整 RF 采样仍弱，4-step sample MSE `1.347`，16-step `teacher_forced_flow` sample MSE `1.635`，16-step `clean video` sample MSE `1.596`。结论：step1000 已学到局部 video-conditioned denoise，但完整从噪声生成未收敛，下一步应优先继续训练/保存更高 step，而不是先调采样器。
 [进行中] 8-GPU resume 主训练：训练脚本已新增 `--resume-checkpoint` / `--resume-load-optimizer`，当前 session `one_way_expert_lidar14_resume8gpu_to5k_20260419_221914` 从 `step_001000.pt` 续训到 `max_steps=5000`，`save_every=500`。配置为 `world_size=8`、`global_batch=8`、`lidar_num_blocks=14`、`--no-checkpoint-lidar-blocks`、`flash_only`。已确认 `step=1010 loss=0.4888`、`step=1020 loss=0.5961`，稳态约 `24.7s/step`，显存约 `74GB/GPU`。该 tmux job 在训练结束后会自动运行 step5000 的 validation inference：4-step preview、16-step `teacher_forced_flow`、16-step `clean video`。
-[已完成] Paired latent cache 入口：`scripts/cache_waymo_paired_video_lidar_latents.py`，训练脚本新增 `--paired-latent-cache-dir`。`batch=3 + checkpoint on` 在线短测在 step1 前明显卡数据/CPU worker，说明 b3/b4 要等 paired cache 后再重测，不能直接用在线 pipeline 判断。
+[已完成] Paired latent cache 入口：`scripts/cache_waymo_paired_video_lidar_latents.py`，训练脚本新增 `--paired-latent-cache-dir`。canonical validation smoke `10203656353524179475_7625_000_7645_000_0` 已保存 paired payload、raw 五视图视频（row + 3x2 grid）、raw-vs-latent 视频对比和 LiDAR decode；LiDAR 可视化使用 `prediction_key=paired_cache_decode`、raw LiDAR GT、`front_view + vehicle + plotly`，指标 `RMSE 5.798 / MAE 1.576 / Rel 0.0501`。Plotly/Kaleido 点云渲染新增 `--pcd-workers`，本机标准用 `--pcd-workers 12`。截至 `2026-04-21 23:03 CST`，training paired cache 已写 `10296 / ~13900` 个 `.pt`，7 个 tmux shard 仍在运行。
 [待做]   GALA sparse 投影 + MDNS noise schedule 实装（~5-6 天，可与上面训练并行开发）
 [待做]   双向 gated GALA 接入（仅在 one-way 收敛后试探打开）
 [待做]   评测脚本：DAS / CME / Reproj-Edge / 下游 3D detection（~3 天）
@@ -928,6 +932,53 @@ Apr 29 - May 2: 评测 + 补实验
 一句话总结：
 
 **LiDAR tokenizer 已升级到 3D OpenSora-S3，与 video VAE 时钟天然一致；video 后训练已有 iter_33000 可用 checkpoint；one-way expert baseline 已通过 1-step smoke，并在当前可见 7×A100 上以 `max_steps=30000` 主训练中。剩余时间聚焦 GALA + MDNS 接入 + ablation 实验闭环，且默认视频生成路径必须保持不变。**
+
+2026-04-26 晚更新：
+
+- 已停止 online Wan2.1 LiDAR VAE 训练和 step_2000 eval；online 训练最后可靠 checkpoint 为 `step_002500.pt`。
+- 训练主线切到 paired cache：`video -> /data/waymo/chunk/training/samples`，LiDAR cache root 为 `/data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1312_repeatrow11`，目标补齐 `13,900` 个 sample。
+- 当前 cache 补齐任务已加到 42 shards：`wan21_train_cache_shards42_20260426_234620_s{0..41}`，日志在 `/data2/waymo_paired_latents/logs/wan21_train_cache_shards42_20260426_234620`。
+- watcher 为 `wan21_cache42_then_train_fallback_20260426_234638`，cache 完成后会先启动 no-checkpoint DDP；如果 DDP 非 0 退出，则自动切到 FSDP2 fallback。
+- 当时 cache 完成后优先启动 `14 blocks + VIDEO_KV_EVERY_N_LAYERS=4 + --no-checkpoint-lidar-blocks` 做速度边界测试；2026-04-29 已切回 full 28-block + video-weight init 主线。同时新增 FSDP2 opt-in 入口 `train_waymo_video_lidar_one_way_wan21_cache_fsdp.sh`，只 shard trainable LiDAR expert，不影响默认 video generation。
+
+2026-04-27 凌晨更新：
+
+- paired cache 已补齐 `13,900/13,900`。旧 raw-downsample paired cache 已废弃；当前 cache video 侧软链接真实 Wan video latent，LiDAR 侧为 Wan2.1 native `64x1312 repeat_row=11` latent。
+- no-checkpoint DDP 的实际内存边界已确认：`14 blocks + vkv=4 + batch/rank=1` 在释放 frozen-video Q/K/V/cross 中间张量后可以过 `step=1`，但下一轮仍在 frozen video MLP 处 OOM，峰值约 `78.1GB/GPU`，还差一次 `2.20GB` 分配。因此该配置不能作为稳定主训练。
+- FSDP2 fallback 当前不是即插即用：one-way expert 直接调用 LiDAR block 内部模块，绕过 FSDP2 wrapper forward，导致 Tensor/DTensor 混用。要继续 FSDP2，需要重构 LiDAR block 的 forward 边界。
+- 当前稳定训练已切到 checkpoint DDP：session `wan21_cp_b2_train_20260427_002810`，输出 `/data2/waymo_video_lidar_one_way_expert/real_video_wan21_lidar_lidar14_vkv4_cp_b2_7gpu_after_cache42_20260427_002810`。配置 `batch/rank=2`、`world_size=7`、`global_batch=14`、`lidar_num_blocks=14`、`VIDEO_KV_EVERY_N_LAYERS=4`、`CHECKPOINT_LIDAR_BLOCKS=true`。已到 `step=10`，loss `3.3592 -> 1.5709`，稳态 `42.15s/step`，显存约 `40.8-41.9GB/GPU`，训练继续运行中。
+
+2026-04-29 检查更新：
+
+- 已停止 `wan21_cp_b2_train_20260427_002810`。最后可靠 checkpoint 为 `step_004000.pt`；训练日志停在 `step=4020` 是人工 kill 后的正常退出。
+- `step_001500 -> step_004000` 的 validation sample 基本无改善：`sample_mse 1.3619 -> 1.3629`，`single_step_denoised_mse 0.9227 -> 0.9257`。继续原配置训练收益很低。
+- RF 目标与官方 Predict2 对齐：`shift=5`、`x_t=sigma*noise+(1-sigma)*clean`、target=`noise-clean`，UniPC `flow_prediction` 方向也正确；当前问题不是 sampler 符号反了。
+- 主要代码问题：LiDAR expert 之前是同尺寸 14-block DiT clone，但从随机初始化开始训练，没有继承 frozen video DiT 的同形状权重。已新增 `--init-lidar-from-video`，只拷贝 same-shape tensor；Wan2.1 cache 训练入口默认开启。该改动仍是 opt-in one-way 训练路径，不影响既有 video generation。
+- 按最新方案，主线改回 full 28-block LiDAR expert，默认从完整 frozen video DiT 初始化 28 个 block 的同形状权重。默认启动配置先用 `LIDAR_NUM_BLOCKS=28`、`CHECKPOINT_LIDAR_BLOCKS=true`、`BATCH_SIZE=1`，先测显存和首轮收敛，再决定是否放大 batch。
+
+2026-05-05 检查更新：
+
+- 已人工停止 full 28-block one-way 主训练：session `wan21_full28_init_cp_b2_7gpu_formal_20260429_005200`。最后保存 checkpoint 为 `step_007000.pt`，训练实际日志到 `step=7025` 左右。
+- 该 run 配置：`LIDAR_NUM_BLOCKS=28`、`INIT_LIDAR_FROM_VIDEO=true`、`VIDEO_KV_EVERY_N_LAYERS=4`、`CHECKPOINT_LIDAR_BLOCKS=true`、`batch_size_per_rank=2`、`world_size=7`、`global_batch=14`，paired cache 为 `/data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1312_repeatrow11`。
+- 训练性能稳定：`~83.8-84.2s/step`，显存约 `54.1GB/GPU`，7 张 A100 utilization 100%。checkpoint 每 500 step 保存，已有 `step_000500.pt` 到 `step_007000.pt`。
+- loss 在 `5k -> 7k` 进入平台期，常见区间 `0.32-0.38`，后段偶有 `0.5-0.8` spike；继续训练的收益不明确。
+- 同一 validation sample、4-step latent 推理显示 `step_007000` 不优于 `step_005000`：
+  - `step_005000`: `sample_mse=0.733270`、`sample_mae=0.645834`、`single_step_denoised_mse=0.250332`
+  - `step_007000`: `sample_mse=0.824434`、`sample_mae=0.691515`、`single_step_denoised_mse=0.266189`
+- 因此当前 checkpoint 选择：`step_005000.pt` 作为 best candidate，`step_007000.pt` 只保留做 ablation/overfit 对照。
+- 已按要求用 `step_003000.pt` 跑 4-step decode 可视化，不继续扩展 16-sample 指标。输出目录：`/tmp/waymo_infer_step003000_val0_s4_decode_20260505_2250`。
+  - sample：`10203656353524179475_7625_000_7645_000_0`
+  - preview：`10203656353524179475_7625_000_7645_000_0_preview.png`
+  - intermediate preview：`10203656353524179475_7625_000_7645_000_0_intermediate_preview.png`
+  - 4-step sampled latent metric：`mse=0.860675`、`mae=0.718463`、`rmse=0.927726`
+  - single-step denoised metric：`mse=0.248937`、`mae=0.378692`
+  - intermediate 4-step MSE 单调下降：`2.044374 -> 1.765859 -> 1.363221 -> 0.860675`
+- 已补跑 `step_005000.pt` 的同配置 4-step decode 可视化。输出目录：`/tmp/waymo_infer_step005000_val0_s4_decode_20260505_2308`。
+  - preview：`10203656353524179475_7625_000_7645_000_0_preview.png`
+  - intermediate preview：`10203656353524179475_7625_000_7645_000_0_intermediate_preview.png`
+  - 4-step sampled latent metric：`mse=0.733270`、`mae=0.645834`、`rmse=0.856312`
+  - single-step denoised metric：`mse=0.250332`、`mae=0.374351`
+  - intermediate 4-step MSE 单调下降：`2.026494 -> 1.718947 -> 1.257420 -> 0.733270`
 
 ---
 

@@ -5,7 +5,7 @@
 Project environment:
 
 ```bash
-conda activate cosmos-transfer2.5
+conda activate cosmos-transfer2.5-merge
 ```
 
 The current implementation direction is **online-first paired loading**, not an offline latent-cache-first pipeline:
@@ -30,9 +30,63 @@ python scripts/train_waymo_video_to_lidar_baseline.py \
   --device cuda
 ```
 
-This keeps the LiDAR latent at the normal S3 size `B x 16 x 8 x 64 x 112`. Non-`64x112` resizing is guarded behind `--allow-lidar-resize-for-smoke` and should not be used for baseline runs.
+This keeps the LiDAR latent at the official LTCV contract `B x 16 x 8 x 64 x 226`. The mainline path keeps the full downsampled Waymo range map width `1800`, lets the tokenizer pad it to `1808`, stores `compressed_latent_from_encoder`, and saves `exact_context_latent` alongside it for decode. Non-`64x226` resizing is guarded behind `--allow-lidar-resize-for-smoke` and should not be used for baseline runs.
+
+2026-04-25 Wan2.1 LiDAR latent update:
+- 2026-04-26 training mainline is moving from online Wan2.1 LiDAR VAE encode to completed paired cache, because online encode made the trainer slow and under-utilized memory
+- online entry remains `train_waymo_video_lidar_one_way_wan21_online.sh` for debug/repro
+- cache training entry is `train_waymo_video_lidar_one_way_wan21_cache.sh`; FSDP2 opt-in entry is `train_waymo_video_lidar_one_way_wan21_cache_fsdp.sh`
+- cache training keeps real video latent from `/data/waymo/chunk/training/samples` and precomputes LiDAR Wan2.1 latent from `/data2/rds_hq_waymo/<split>/lidar_raw`
+- target stable config after cache completion: `LIDAR_NUM_BLOCKS=14`, `VIDEO_KV_EVERY_N_LAYERS=4`, `CHECKPOINT_LIDAR_BLOCKS=true`, `BATCH_SIZE=2`
+- no-checkpoint DDP boundary: `CHECKPOINT_LIDAR_BLOCKS=false`, `BATCH_SIZE=1` reaches `step=1` after frozen-video temp cleanup but OOMs on the next frozen video MLP peak at ~`78.1GB/GPU`; it is not the stable mainline
+- FSDP2 path shards only trainable LiDAR expert while keeping frozen video replicated, but currently needs a LiDAR block forward-boundary refactor because direct internal block calls trigger Tensor/DTensor mixing
+- the Wan-native cache path is generated via `scripts/cache_waymo_lidar_wan21_latents.py`
+- cache contract: `wan21_native64x1312_repeatrow11_v1`
+- LiDAR latent shape: `16 x 8 x 88 x 164`
+- video latent remains the real cached Wan video latent from `/data/waymo/chunk/training/samples`, shape `16 x 40 x 90 x 160`
+- the paired cache root is `/data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1312_repeatrow11`
+- the cache-training entry remains `train_waymo_video_lidar_one_way_wan21_cache.sh`
+- current run: tmux `wan21_cp_b2_train_20260427_002810`, output `/data2/waymo_video_lidar_one_way_expert/real_video_wan21_lidar_lidar14_vkv4_cp_b2_7gpu_after_cache42_20260427_002810`; `step=10`, loss `3.3592 -> 1.5709`, `42.15s/step`, `40.8-41.9GB/GPU`
+
+2026-04-21 validation note:
+- the switched online extractor now matches the official `lidar_cli.py` path on the canonical Waymo sample
+- decoded reconstruction metrics are `RMSE 5.8006 / MAE 1.5767 / Rel 0.0501`
+- old checkpoints trained on cropped `224/225`-style LiDAR targets are not resume-compatible with this corrected `226 + exact_context` contract
+
+2026-04-21 paired-cache visualization note:
+- canonical sample: `10203656353524179475_7625_000_7645_000_0`
+- paired-cache smoke payload: `/data2/waymo_paired_cache_smoke/validation/raw_downsample/10203656353524179475_7625_000_7645_000_0/10203656353524179475_7625_000_7645_000_0.pt`
+- raw five-view preview: `/data2/waymo_paired_cache_smoke/validation/raw_downsample/10203656353524179475_7625_000_7645_000_0/10203656353524179475_7625_000_7645_000_0_five_view_raw.mp4`
+- raw five-view grid preview: `/data2/waymo_paired_cache_smoke/validation/raw_downsample/10203656353524179475_7625_000_7645_000_0/10203656353524179475_7625_000_7645_000_0_five_view_raw_grid.mp4`
+- raw-vs-video-latent preview: `/data2/waymo_paired_cache_smoke/validation/raw_downsample/10203656353524179475_7625_000_7645_000_0/10203656353524179475_7625_000_7645_000_0_video_compare.mp4`
+- LiDAR point cloud visualization uses `prediction_key=paired_cache_decode`, `gt_source=raw`, `camera_view=front_view`, `display_frame=vehicle`, and `pcd_renderer=plotly`
+- multi-worker Plotly/Kaleido is the default practical path for doc-matched point-cloud videos; use `--pcd-workers 12` on this 256-core host
 
 For the real frozen-video-VAE path, switch `--video-tokenizer wan2pt1` once the Wan2.1 VAE checkpoint or S3 credential is available locally.
+
+Doc-matched point-cloud visualization command:
+
+```bash
+conda activate cosmos-transfer2.5-merge
+
+python scripts/visualize_decoded_lidar_waymo.py \
+  --decoded-path /data2/waymo_paired_cache_smoke/validation/raw_downsample/10203656353524179475_7625_000_7645_000_0/10203656353524179475_7625_000_7645_000_0_lidar_decoded.pt \
+  --output-dir /data2/waymo_paired_cache_smoke/validation/raw_downsample/10203656353524179475_7625_000_7645_000_0/lidar_vis_merge_plotly_full \
+  --sample-key 10203656353524179475_7625_000_7645_000_0 \
+  --prediction-key paired_cache_decode \
+  --gt-key gt_tokenizer_recon \
+  --gt-source auto \
+  --raw-lidar-root /data2/rds_hq_waymo/lidar_tokenizer \
+  --split validation \
+  --segment-key 10203656353524179475_7625_000_7645_000 \
+  --lidar-frame-indices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28 \
+  --vis-pcd \
+  --camera-view front_view \
+  --display-frame vehicle \
+  --pcd-renderer plotly \
+  --pcd-workers 12 \
+  --lidar-tokenizer-repo /root/workspace/Cosmos-Drive-Dreams/cosmos-transfer-lidargen
+```
 
 ## 1. Goal
 

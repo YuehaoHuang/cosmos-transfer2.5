@@ -18,7 +18,7 @@ echo ""
 # 检查是否在 conda 环境中
 if [[ -z "$CONDA_DEFAULT_ENV" ]]; then
     echo "⚠️  警告: 未检测到 conda 环境，请先激活环境"
-    echo "   运行: conda activate cosmos-transfer2.5"
+    echo "   运行: conda activate cosmos-transfer2.5-merge"
     exit 1
 fi
 

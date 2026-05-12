@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,7 @@ from cache_waymo_lidar_s3_latents import (
     DEFAULT_LIDAR_REPO,
     DEFAULT_TOKENIZER_CKPT,
     DEFAULT_TOKENIZER_CONFIG,
+    _extract_official_ltcv_latent,
     _load_lidar_window,
     _load_tokenizer,
     _preprocess_range_maps,
@@ -52,7 +54,10 @@ WAYMO_CAMERAS = (
     "pinhole_side_left",
     "pinhole_side_right",
 )
-NORMAL_LIDAR_LATENT_HW = (64, 112)
+NORMAL_LIDAR_LATENT_HW = (64, 226)
+WAN_HF_REPO_CACHE = "models--nvidia--Cosmos-Predict2.5-2B"
+WAN_HF_REVISION = "6787e176dce74a101d922174a95dba29fa5f0c55"
+WAN_HF_FILENAME = "tokenizer.pth"
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,11 +78,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--train-height", type=int, default=64)
-    parser.add_argument("--train-width", type=int, default=112)
+    parser.add_argument("--train-width", type=int, default=226)
     parser.add_argument(
         "--allow-lidar-resize-for-smoke",
         action="store_true",
-        help="Allow non-64x112 LiDAR latent resizing only for local smoke tests.",
+        help="Allow non-64x226 LiDAR latent resizing only for local smoke tests.",
     )
     parser.add_argument("--latent-frames", type=int, default=8)
     parser.add_argument("--log-every", type=int, default=10)
@@ -100,8 +105,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downsample-method", default="scatter_min")
     parser.add_argument("--repeat-row", type=int, default=4)
     parser.add_argument("--repeat-col", type=int, default=1)
-    parser.add_argument("--lidar-crop-width", type=int, default=896)
-    parser.add_argument("--crop-mode", default="center", choices=["center", "left", "none"])
+    parser.add_argument(
+        "--lidar-crop-width",
+        type=int,
+        default=0,
+        help="Optional pre-tokenizer crop width. Default 0 keeps the full downsampled Waymo range map.",
+    )
+    parser.add_argument("--crop-mode", default="none", choices=["center", "left", "none"])
     parser.add_argument("--max-range", type=float, default=100.0)
     parser.add_argument("--min-range", type=float, default=5.0)
     parser.add_argument("--min-value", type=float, default=-1.0)
@@ -162,10 +172,19 @@ class OnlineLidarS3Encoder:
             torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def encode_batch(self, segment_keys: list[str], frame_indices: torch.Tensor) -> torch.Tensor:
+    def encode_batch(
+        self,
+        segment_keys: list[str],
+        frame_indices: torch.Tensor,
+        *,
+        return_exact_context: bool = False,
+        return_crop_region: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if self.offload_to_cpu:
             self.model = self.model.to(self.device)
         latents = []
+        exact_contexts = []
+        crop_regions: list[list[int]] = []
         try:
             for batch_idx, segment_key in enumerate(segment_keys):
                 tar_path = self.raw_lidar_dir / f"{segment_key}.tar"
@@ -175,14 +194,27 @@ class OnlineLidarS3Encoder:
                     device=self.args.device,
                     dtype=getattr(torch, self.args.dtype),
                 )
-                encoded = self.model.encode(input_tensor)
-                latent = encoded[0] if isinstance(encoded, tuple) else encoded
+                latent, exact_context_latent, crop_region, _ = _extract_official_ltcv_latent(self.model, input_tensor)
                 latents.append(latent.squeeze(0).detach())
+                if return_exact_context:
+                    if exact_context_latent is None:
+                        raise RuntimeError("Tokenizer did not return exact_context_latent for LiDAR batch encode.")
+                    exact_contexts.append(exact_context_latent.squeeze(0).detach())
+                if return_crop_region:
+                    crop_regions.append(crop_region)
         finally:
             if self.offload_to_cpu:
                 self.model = self.model.to("cpu")
                 torch.cuda.empty_cache()
-        return torch.stack(latents, dim=0)
+        latent_batch = torch.stack(latents, dim=0)
+        outputs: list[torch.Tensor] = [latent_batch]
+        if return_exact_context:
+            outputs.append(torch.stack(exact_contexts, dim=0))
+        if return_crop_region:
+            outputs.append(torch.tensor(crop_regions, dtype=torch.int64))
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)
 
 
 class OnlineVideoEncoder:
@@ -199,8 +231,15 @@ class OnlineVideoEncoder:
                 "s3_credential_path": args.wan_s3_credential_path,
                 "temporal_window": 4,
             }
-            if args.wan_vae_path:
-                kwargs["vae_pth"] = args.wan_vae_path
+            resolved_vae_path = resolve_wan_vae_path(args.wan_vae_path)
+            if resolved_vae_path:
+                kwargs["vae_pth"] = resolved_vae_path
+                print(f"[video-tokenizer] resolved wan2pt1 VAE path: {resolved_vae_path}")
+            else:
+                print(
+                    "[video-tokenizer] wan2pt1 VAE not found under HF_HOME; "
+                    "falling back to the default checkpoint URI/S3 path."
+                )
             self.tokenizer = Wan2pt1VAEInterface(chunk_duration=args.num_video_frames, load_mean_std=False, **kwargs)
 
     @torch.no_grad()
@@ -321,12 +360,34 @@ def maybe_resize_lidar(
         return lidar
     if not allow_resize_for_smoke:
         raise ValueError(
-            "LiDAR baseline must use the normal S3 latent size "
-            f"{NORMAL_LIDAR_LATENT_HW}, got latent shape {tuple(lidar.shape)} and "
+            "LiDAR baseline must use the normal full-width S3 latent size "
+            f"{NORMAL_LIDAR_LATENT_HW}. "
+            f"Got latent shape {tuple(lidar.shape)} and "
             f"requested train size {(train_height, train_width)}. "
             "Pass --allow-lidar-resize-for-smoke only for explicit local smoke tests."
         )
     return F.interpolate(lidar, size=(lidar.shape[2], train_height, train_width), mode="trilinear", align_corners=False)
+
+
+def resolve_wan_vae_path(explicit_path: str | None) -> str | None:
+    if explicit_path:
+        return explicit_path
+
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        return None
+
+    hf_root = Path(hf_home)
+    repo_root = hf_root / "hub" / WAN_HF_REPO_CACHE
+    candidates = [
+        repo_root / "snapshots" / WAN_HF_REVISION / WAN_HF_FILENAME,
+        *sorted(repo_root.glob("snapshots/*/tokenizer.pth")),
+        *sorted(hf_root.rglob("Wan2.1_VAE.pth")),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def validate_one_way_policy() -> None:
@@ -357,7 +418,7 @@ def main() -> None:
         args.save_every = max(args.save_every, 1)
     if not args.allow_lidar_resize_for_smoke and (args.train_height, args.train_width) != NORMAL_LIDAR_LATENT_HW:
         raise ValueError(
-            "LiDAR baseline uses the normal S3 latent size by default: "
+            "LiDAR baseline uses the normal full-width S3 latent size by default: "
             f"{NORMAL_LIDAR_LATENT_HW}. Remove --train-height/--train-width overrides, "
             "or pass --allow-lidar-resize-for-smoke for a non-baseline smoke run."
         )

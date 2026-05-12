@@ -22,7 +22,7 @@ It uses the full Transfer2 augmentor pipeline including:
 - Automatic resizing with aspect ratio preservation
 - Reflection padding
 - Text transforms for caption handling
-- Control input generation (edge, depth, seg, blur, etc.)
+- Control input generation or loading (edge, depth, seg, blur, rangemap_layout, etc.)
 
 Example usage:
     dataset = SingleViewTransferDataset(
@@ -48,7 +48,10 @@ from torch.utils.data import Dataset
 
 from cosmos_transfer2._src.imaginaire.lazy_config import instantiate
 from cosmos_transfer2._src.imaginaire.utils import log
-from cosmos_transfer2._src.transfer2.datasets.augmentor_provider import get_video_augmentor_v2_with_control
+from cosmos_transfer2._src.transfer2.datasets.augmentor_provider import (
+    get_rangemap_layout_augmentor_for_local_datasets,
+    get_video_augmentor_v2_with_control,
+)
 from cosmos_transfer2._src.transfer2.utils.input_handling import detect_aspect_ratio
 
 
@@ -79,6 +82,7 @@ CTRL_TYPE_INFO = {
     "keypoint": {"folder": "keypoint", "format": "pickle", "data_dict_key": "keypoint"},
     "depth": {"folder": "depth", "format": "mp4", "data_dict_key": "depth"},
     "seg": {"folder": "seg", "format": "mp4", "data_dict_key": "segmentation"},
+    "rangemap_layout": {"folder": "rangemap_layout", "format": "mp4", "data_dict_key": "rangemap_layout"},
     "edge": {"folder": None},  # Canny edge, computed on-the-fly by augmentor
     "vis": {"folder": None},  # Blur, computed on-the-fly by augmentor
 }
@@ -88,7 +92,8 @@ class SingleViewTransferDataset(Dataset):
     """Dataset class for loading single-view video-to-video generation data with control inputs.
 
     This dataset is designed for post-training Cosmos-Transfer2 models with local video files.
-    It supports various control modalities including depth, segmentation, edge, and blur.
+    It supports various control modalities including depth, segmentation, edge,
+    blur, and precomputed rangemap_layout videos.
 
     Dataset structure:
         dataset_dir/
@@ -98,8 +103,8 @@ class SingleViewTransferDataset(Dataset):
         ├── captions/
         │   ├── video1.json  ({"caption": "text description"})
         │   └── video2.json
-        └── <control_type>/  (optional for depth/seg, computed on-the-fly for edge/vis)
-            ├── video1.mp4  (for depth)
+        └── <control_type>/  (optional for depth/seg/rangemap_layout, computed on-the-fly for edge/vis)
+            ├── video1.mp4  (for depth or rangemap_layout)
             └── video1.pickle  (for seg/keypoint)
 
     Args:
@@ -158,23 +163,32 @@ class SingleViewTransferDataset(Dataset):
         # This includes randomized edge detection, reflection padding, and text transforms
         # Pass embedding_type=None since we're handling T5 embeddings ourselves
         # (if embedding_type is set, the function returns early with only video_parsing)
-        augmentor_config = get_video_augmentor_v2_with_control(
-            resolution=resolution,
-            caption_type=caption_type,
-            embedding_type=None,  # We handle embeddings ourselves, get full augmentor pipeline
-            control_input_type=self.ctrl_type,
-            use_random=is_train,  # Enable random augmentations for training
-        )
+        if self.ctrl_type == "rangemap_layout":
+            augmentor_config = get_rangemap_layout_augmentor_for_local_datasets(
+                resolution=resolution,
+                caption_type=caption_type,
+                embedding_type=None,
+                control_input_type=self.ctrl_type,
+                use_random=is_train,
+            )
+        else:
+            augmentor_config = get_video_augmentor_v2_with_control(
+                resolution=resolution,
+                caption_type=caption_type,
+                embedding_type=None,  # We handle embeddings ourselves, get full augmentor pipeline
+                control_input_type=self.ctrl_type,
+                use_random=is_train,  # Enable random augmentations for training
+            )
 
-        # Filter out augmentors that don't apply to local datasets
-        # The augmentor pipeline includes augmentors designed for S3/WebDataset that need to be skipped:
-        # - video_parsing: Decodes video bytes from S3 → we already load tensors from local MP4 files
-        # - depth_parsing: Decodes depth bytes from S3 key "depth_pervideo_video_depth_anything" → we load from local depth/ folder
-        # - seg_parsing: Decodes seg bytes from S3 key "segmentation_sam2_color_video_v2" → we load from local seg/ folder
-        # - merge_datadict: Merges multiple WebDataset shards → not needed for single local dataset
-        # - text_transform: Loads pre-computed T5 embeddings → we pass raw captions for on-the-fly encoding
-        skip_augmentors = ["video_parsing", "merge_datadict", "text_transform", "depth_parsing", "seg_parsing"]
-        augmentor_config = {k: v for k, v in augmentor_config.items() if k not in skip_augmentors}
+            # Filter out augmentors that don't apply to local datasets
+            # The augmentor pipeline includes augmentors designed for S3/WebDataset that need to be skipped:
+            # - video_parsing: Decodes video bytes from S3 → we already load tensors from local MP4 files
+            # - depth_parsing: Decodes depth bytes from S3 key "depth_pervideo_video_depth_anything" → we load from local depth/ folder
+            # - seg_parsing: Decodes seg bytes from S3 key "segmentation_sam2_color_video_v2" → we load from local seg/ folder
+            # - merge_datadict: Merges multiple WebDataset shards → not needed for single local dataset
+            # - text_transform: Loads pre-computed T5 embeddings → we pass raw captions for on-the-fly encoding
+            skip_augmentors = ["video_parsing", "merge_datadict", "text_transform", "depth_parsing", "seg_parsing"]
+            augmentor_config = {k: v for k, v in augmentor_config.items() if k not in skip_augmentors}
 
         log.info(f"Filtered augmentors: {list(augmentor_config.keys())}")
 
@@ -377,6 +391,16 @@ class SingleViewTransferDataset(Dataset):
 
                 # Store with the key expected by AddControlInputDepth augmentor
                 data_dict["depth"] = depth_video
+                del vr
+
+            elif self.ctrl_type == "rangemap_layout":
+                vr = VideoReader(ctrl_path, ctx=cpu(0))
+                if len(vr) < frame_ids[-1] + 1:
+                    raise ValueError(f"Range-map layout control video has fewer frames than target video: {ctrl_path}")
+
+                layout_frames = vr.get_batch(frame_ids).asnumpy().astype(np.uint8)
+                layout_t = torch.from_numpy(layout_frames).permute(0, 3, 1, 2)
+                data_dict["rangemap_layout"] = layout_t.permute(1, 0, 2, 3)
                 del vr
 
         except Exception as e:

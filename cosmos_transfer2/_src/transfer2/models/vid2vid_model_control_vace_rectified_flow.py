@@ -48,6 +48,7 @@ IS_PREPROCESSED_KEY = "is_preprocessed"
 @attrs.define(slots=False)
 class ControlVideo2WorldRectifiedFlowConfig(Video2WorldModelRectifiedFlowConfig):
     base_load_from: LazyDict = None
+    freeze_base_model: bool = True  # Official control post-training freezes the base model by default.
     min_num_conditional_frames: int = 0  # Minimum number of latent conditional frames
     max_num_conditional_frames: int = 2  # Maximum number of latent conditional frames
     copy_weight_strategy: str = (
@@ -504,7 +505,10 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
 
     def set_up_model(self):
         super().set_up_model()
-        self.freeze_base_model()
+        if self.config.freeze_base_model:
+            self.freeze_base_model()
+        else:
+            log.info("\nTraining base model and control branch\n")
         self.load_base_model()
         self.copy_weights_to_control_branch()
 

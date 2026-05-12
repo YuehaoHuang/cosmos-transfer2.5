@@ -9,13 +9,16 @@ one sample per file:
 
     {
         "video_latent": (16, 40, 90, 160),
-        "lidar_latent": (16, 8, 64, 112),
+        "lidar_latent": (16, 8, 64, 226),
         ...
     }
 
 The default video tokenizer is ``raw_downsample`` so cache generation can be
 used immediately for throughput experiments. Switch to ``wan2pt1`` when the
 real frozen video VAE path is available.
+
+Recommended environment:
+    conda activate cosmos-transfer2.5-merge
 """
 
 from __future__ import annotations
@@ -86,18 +89,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downsample-method", default="scatter_min")
     parser.add_argument("--repeat-row", type=int, default=4)
     parser.add_argument("--repeat-col", type=int, default=1)
-    parser.add_argument("--lidar-crop-width", type=int, default=896)
-    parser.add_argument("--crop-mode", default="center", choices=["center", "left", "none"])
+    parser.add_argument(
+        "--lidar-crop-width",
+        type=int,
+        default=0,
+        help="Optional pre-tokenizer crop width. Default 0 keeps the full downsampled Waymo range map.",
+    )
+    parser.add_argument("--crop-mode", default="none", choices=["center", "left", "none"])
     parser.add_argument("--max-range", type=float, default=100.0)
     parser.add_argument("--min-range", type=float, default=5.0)
     parser.add_argument("--min-value", type=float, default=-1.0)
     parser.add_argument("--latent-frames", type=int, default=8)
     parser.add_argument("--train-height", type=int, default=64)
-    parser.add_argument("--train-width", type=int, default=112)
+    parser.add_argument("--train-width", type=int, default=226)
     parser.add_argument(
         "--allow-lidar-resize-for-smoke",
         action="store_true",
-        help="Allow non-64x112 LiDAR latent resizing only for local smoke tests.",
+        help="Allow non-64x226 LiDAR latent resizing only for local smoke tests.",
     )
     return parser.parse_args()
 
@@ -164,13 +172,19 @@ def main() -> None:
 
         with torch.no_grad():
             video_latent = video_encoder.encode(batch["video"]).detach().cpu().to(dtype=save_dtype)
-            lidar_latent = lidar_encoder.encode_batch(batch["waymo_segment_key"], batch["waymo_lidar_frame_indices"])
+            lidar_latent, exact_context_latent, tokenizer_crop_region = lidar_encoder.encode_batch(
+                batch["waymo_segment_key"],
+                batch["waymo_lidar_frame_indices"],
+                return_exact_context=True,
+                return_crop_region=True,
+            )
             lidar_latent = maybe_resize_lidar(
                 lidar_latent,
                 args.train_height,
                 args.train_width,
                 args.allow_lidar_resize_for_smoke,
             ).detach().cpu().to(dtype=save_dtype)
+            exact_context_latent = exact_context_latent.detach().cpu().to(dtype=save_dtype)
 
         for batch_idx, output_path in enumerate(output_paths):
             if output_path.exists() and not args.overwrite:
@@ -182,6 +196,8 @@ def main() -> None:
                 "lidar_frame_indices": batch["waymo_lidar_frame_indices"][batch_idx].cpu(),
                 "video_latent": video_latent[batch_idx],
                 "lidar_latent": lidar_latent[batch_idx],
+                "exact_context_latent": exact_context_latent[batch_idx],
+                "tokenizer_crop_region": tokenizer_crop_region[batch_idx].tolist(),
                 "video_tokenizer": args.video_tokenizer,
                 "lidar_tokenizer_ckpt": args.lidar_tokenizer_ckpt,
                 "split": args.split,
