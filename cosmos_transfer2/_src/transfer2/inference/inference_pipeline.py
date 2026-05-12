@@ -366,7 +366,9 @@ class ControlVideo2WorldInference:
         # Get text context embeddings
         log.info("Computing prompt text embeddings...")
         with _maybe_get_timer(self.benchmark_timer, "get_text_embeddings"):
-            if self.text_encoder_class == "T5":
+            if isinstance(prompt, torch.Tensor):
+                text_embeddings = prompt
+            elif self.text_encoder_class == "T5":
                 text_embeddings = get_t5_from_prompt(prompt, text_encoder_class="T5", cache_dir=self.cache_dir)
             else:
                 text_embeddings = self.model.text_encoder.compute_text_embeddings_online(

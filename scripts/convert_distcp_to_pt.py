@@ -60,6 +60,9 @@ class Args:
     ema: bool = True
     """Export EMA weights."""
 
+    regular: bool = False
+    """Export regular model weights in bf16 precision."""
+
     s3_args: str | None = None
     """Additional arguments to pass to s5cmd."""
 
@@ -104,6 +107,22 @@ def main():
     # Convert distributed checkpoint to torch single checkpoint
     dcp_to_torch_save(distcp_dir, pt_path)
     print(f"Converted '{distcp_dir}' to '{pt_path}'")
+
+    if args.regular:
+        state_dict: dict[str, Any] = torch.load(pt_path, map_location="cpu", weights_only=False)
+        state_dict_reg_bf16: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            if not key.startswith("net."):
+                continue
+            if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
+                value = value.bfloat16()
+            state_dict_reg_bf16[key] = value
+        if not state_dict_reg_bf16:
+            raise ValueError("Model doesn't contain regular net.* weights")
+        pt_reg_bf16_path = args.output_dir / "model_reg_bf16.pt"
+        pt_reg_bf16_path.unlink(missing_ok=True)
+        torch.save(state_dict_reg_bf16, pt_reg_bf16_path)
+        print(f"Saved regular bf16 weights from '{pt_path}' to '{pt_reg_bf16_path}'")
 
     if not args.ema:
         return

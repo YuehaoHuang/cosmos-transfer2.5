@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-weight", default="1.0")
     parser.add_argument("--sigma-max", type=float, default=None)
     parser.add_argument("--negative-prompt", default=None)
+    parser.add_argument("--zero-text-embedding", action="store_true")
+    parser.add_argument("--text-embedding-tokens", type=int, default=512)
     parser.add_argument("--skip-comparison", action="store_true")
     parser.add_argument("--keep-input-resolution", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -187,21 +189,37 @@ def main() -> None:
         "guidance": args.guidance,
         "seed": args.seed,
         "control_weight": args.control_weight,
+        "zero_text_embedding": args.zero_text_embedding,
     }
     (output_dir / f"{resolved['name']}.json").write_text(json.dumps(metadata, indent=2))
     (output_dir / f"{resolved['name']}.txt").write_text(prompt)
+
+    exp_override_opts = []
+    if args.zero_text_embedding:
+        exp_override_opts.append("model.config.text_encoder_config.compute_online=False")
 
     pipeline = ControlVideo2WorldInference(
         registered_exp_name=args.experiment,
         checkpoint_paths=args.checkpoint_path,
         s3_credential_path="",
-        exp_override_opts=[],
+        exp_override_opts=exp_override_opts,
         config_file=args.config_file,
     )
 
+    generation_prompt: str | torch.Tensor = prompt
+    if args.zero_text_embedding:
+        crossattn_dim = int(pipeline.config.model.config.net.crossattn_proj_in_channels)
+        generation_prompt = torch.zeros(
+            1,
+            args.text_embedding_tokens,
+            crossattn_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
     output_video, control_video_dict, _mask_video_dict, fps, _original_hw = pipeline.generate_img2world(
         video_path=str(resolved["video_path"]),
-        prompt=prompt,
+        prompt=generation_prompt,
         negative_prompt=args.negative_prompt,
         guidance=args.guidance,
         seed=args.seed,

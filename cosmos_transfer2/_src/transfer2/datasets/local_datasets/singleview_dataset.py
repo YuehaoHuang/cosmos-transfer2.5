@@ -50,6 +50,7 @@ from cosmos_transfer2._src.imaginaire.lazy_config import instantiate
 from cosmos_transfer2._src.imaginaire.utils import log
 from cosmos_transfer2._src.transfer2.datasets.augmentor_provider import (
     get_rangemap_layout_augmentor_for_local_datasets,
+    get_video_augmentor_v2,
     get_video_augmentor_v2_with_control,
 )
 from cosmos_transfer2._src.transfer2.utils.input_handling import detect_aspect_ratio
@@ -123,7 +124,7 @@ class SingleViewTransferDataset(Dataset):
         num_frames: int,
         video_size: tuple[int, int],
         resolution: str = "720",
-        hint_key: str = "control_input_edge",
+        hint_key: str | None = "control_input_edge",
         is_train: bool = True,
         caption_type: str = "t2w_qwen2p5_7b",  # Use Qwen2.5-7B caption type
         **kwargs,  # Accept extra params for config compatibility (like MultiviewTransferDataset)
@@ -136,14 +137,19 @@ class SingleViewTransferDataset(Dataset):
         self.is_train = is_train
         self.caption_type = caption_type
 
-        # Parse control type from hint_key
+        # Parse control type from hint_key. A None hint_key enables video-only
+        # post-training while keeping the same local dataset structure.
         self.hint_key = hint_key
-        self.ctrl_type = hint_key.replace("control_input_", "")
-        if self.ctrl_type not in CTRL_TYPE_INFO:
-            raise ValueError(
-                f"Unsupported control type: {self.ctrl_type}. Supported types: {list(CTRL_TYPE_INFO.keys())}"
-            )
-        self.ctrl_config = CTRL_TYPE_INFO[self.ctrl_type]
+        if hint_key is None:
+            self.ctrl_type = None
+            self.ctrl_config = None
+        else:
+            self.ctrl_type = hint_key.replace("control_input_", "")
+            if self.ctrl_type not in CTRL_TYPE_INFO:
+                raise ValueError(
+                    f"Unsupported control type: {self.ctrl_type}. Supported types: {list(CTRL_TYPE_INFO.keys())}"
+                )
+            self.ctrl_config = CTRL_TYPE_INFO[self.ctrl_type]
 
         # Set up directories
         video_dir = os.path.join(self.dataset_dir, "videos")
@@ -163,7 +169,15 @@ class SingleViewTransferDataset(Dataset):
         # This includes randomized edge detection, reflection padding, and text transforms
         # Pass embedding_type=None since we're handling T5 embeddings ourselves
         # (if embedding_type is set, the function returns early with only video_parsing)
-        if self.ctrl_type == "rangemap_layout":
+        if self.ctrl_type is None:
+            augmentor_config = get_video_augmentor_v2(
+                resolution=resolution,
+                caption_type=caption_type,
+                embedding_type=None,
+            )
+            skip_augmentors = ["video_parsing", "merge_datadict", "text_transform"]
+            augmentor_config = {k: v for k, v in augmentor_config.items() if k not in skip_augmentors}
+        elif self.ctrl_type == "rangemap_layout":
             augmentor_config = get_rangemap_layout_augmentor_for_local_datasets(
                 resolution=resolution,
                 caption_type=caption_type,
@@ -201,7 +215,7 @@ class SingleViewTransferDataset(Dataset):
 
         log.info(f"Initialized SingleViewTransferDataset with {len(self.video_paths)} videos")
         log.info(f"  Dataset dir: {self.dataset_dir}")
-        log.info(f"  Control type: {self.ctrl_type}")
+        log.info(f"  Control type: {self.ctrl_type or 'none'}")
         log.info(f"  Resolution: {resolution}, Video size: {video_size}")
         log.info(f"  Required frames: {self.sequence_length}")
 
@@ -341,6 +355,9 @@ class SingleViewTransferDataset(Dataset):
         Returns:
             Dictionary with control data or None if computed on-the-fly
         """
+        if self.ctrl_type is None or self.ctrl_config is None:
+            return None
+
         # Edge and vis are computed on-the-fly by the augmentor
         if self.ctrl_config["folder"] is None:
             return None
@@ -539,19 +556,25 @@ class SingleViewTransferDataset(Dataset):
                     f"Video should have {self.sequence_length} frames, got {data['video'].shape[1]}"
                 )
 
-                # Check control input exists and has correct format
-                ctrl_key = f"control_input_{self.ctrl_type}"
-                assert ctrl_key in data, f"Control input key '{ctrl_key}' not found in data"
-                assert data[ctrl_key].dtype == torch.uint8, (
-                    f"Control input dtype is {data[ctrl_key].dtype}, expected uint8"
-                )
-                assert data[ctrl_key].shape == data["video"].shape, (
-                    f"Control input shape {data[ctrl_key].shape} doesn't match video shape {data['video'].shape}"
-                )
+                ctrl_key = None
+                if self.ctrl_type is not None:
+                    # Check control input exists and has correct format
+                    ctrl_key = f"control_input_{self.ctrl_type}"
+                    assert ctrl_key in data, f"Control input key '{ctrl_key}' not found in data"
+                    assert data[ctrl_key].dtype == torch.uint8, (
+                        f"Control input dtype is {data[ctrl_key].dtype}, expected uint8"
+                    )
+                    assert data[ctrl_key].shape == data["video"].shape, (
+                        f"Control input shape {data[ctrl_key].shape} doesn't match video shape {data['video'].shape}"
+                    )
 
                 log.debug(
                     f"Dataset sample ready: video={data['video'].shape} {data['video'].dtype}, "
-                    f"{ctrl_key}={data[ctrl_key].shape} {data[ctrl_key].dtype}, "
+                    + (
+                        f"{ctrl_key}={data[ctrl_key].shape} {data[ctrl_key].dtype}, "
+                        if ctrl_key is not None
+                        else "control_input=None, "
+                    )
                 )
 
                 return data

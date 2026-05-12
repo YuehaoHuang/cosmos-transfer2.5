@@ -187,6 +187,23 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["schedul
 )
 
 
+transfer2_singleview_posttrain_waymo_lidar_rangemap_video_domain_fullfinetune = deepcopy(
+    transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune
+)
+transfer2_singleview_posttrain_waymo_lidar_rangemap_video_domain_fullfinetune["defaults"] = [
+    DEFAULT_BASE_EXPERIMENT,
+    {"override /data_train": "example_singleview_train_data_rangemap_video"},
+]
+transfer2_singleview_posttrain_waymo_lidar_rangemap_video_domain_fullfinetune["job"].update(
+    name="transfer2_singleview_posttrain_waymo_lidar_rangemap_video_domain_fullfinetune"
+)
+transfer2_singleview_posttrain_waymo_lidar_rangemap_video_domain_fullfinetune["dataloader_train"][
+    "dataset"
+].update(
+    hint_key=None,
+)
+
+
 # =============================================================================
 # Post-training with Depth Control (2B Model)
 # =============================================================================
@@ -368,6 +385,7 @@ for _item in [
     transfer2_singleview_posttrain_edge_example,
     transfer2_singleview_posttrain_waymo_lidar_rangemap_layout,
     transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune,
+    transfer2_singleview_posttrain_waymo_lidar_rangemap_video_domain_fullfinetune,
     transfer2_singleview_posttrain_depth_example,
     transfer2_singleview_posttrain_seg_example,
     transfer2_singleview_posttrain_vis_example,

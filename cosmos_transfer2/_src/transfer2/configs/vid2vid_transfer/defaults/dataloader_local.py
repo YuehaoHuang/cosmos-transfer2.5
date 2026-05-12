@@ -157,3 +157,28 @@ def register_dataloader_local() -> None:
             pin_memory=True,
         ),
     )
+
+    # Waymo TOP LiDAR range-map video-only domain post-training.
+    dataset_rangemap_video = L(SingleViewTransferDataset)(
+        dataset_dir="PLACEHOLDER_UPDATE_DATASET_PATH",
+        num_frames=29,
+        video_size=(704, 1280),
+        resolution="720",
+        hint_key=None,
+        is_train=True,
+        caption_type="t2w_qwen2p5_7b",
+    )
+
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="example_singleview_train_data_rangemap_video",
+        node=L(get_generic_dataloader)(
+            dataset=dataset_rangemap_video,
+            sampler=L(get_sampler)(dataset=dataset_rangemap_video) if dist.is_initialized() else None,
+            batch_size=1,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+        ),
+    )
