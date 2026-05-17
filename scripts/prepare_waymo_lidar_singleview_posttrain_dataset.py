@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_waymo_lidar_wan21_vae import (  # noqa: E402
     DEFAULT_MPLCONFIGDIR,
+    load_converted_range_maps,
     load_raw_range_maps,
     prepend_lidar_utils_repo,
     preprocess_range_maps,
@@ -45,9 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="training", choices=["training", "validation"])
     parser.add_argument("--waymo-chunk-root", default="/data/waymo/chunk")
     parser.add_argument("--raw-waymo-root", default="/data2/rds_hq_waymo")
+    parser.add_argument("--converted-waymo-root", default="/data2/rds_hq_waymo/lidar_tokenizer")
     parser.add_argument("--caption-json-path", default="/data/waymo/waymo_multiview_texts.json")
     parser.add_argument("--output-root", default="/data2/waymo_singleview_lidar_posttrain")
     parser.add_argument("--camera", default=WAYMO_FRONT_CAMERA)
+    parser.add_argument("--range-map-source", default="raw", choices=["raw", "converted"])
+    parser.add_argument("--sample-list-source", default="camera", choices=["camera", "lidar"])
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--sample-key", default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -88,6 +93,57 @@ def split_sample_key(sample_key: str) -> tuple[str, int]:
     if maybe_chunk.isdigit():
         return base, int(maybe_chunk)
     return sample_key, 0
+
+
+def apply_source_defaults(args: argparse.Namespace) -> None:
+    """Use sane defaults for converted lidar_tokenizer tars without changing the raw path."""
+
+    if args.range_map_source != "converted":
+        return
+    if args.native_n_rows == 64:
+        args.native_n_rows = 128
+    if args.native_n_cols == 1280:
+        args.native_n_cols = 3600
+    if args.downsample_factor_row == 1:
+        args.downsample_factor_row = 2
+    if args.downsample_factor_col == 1:
+        args.downsample_factor_col = 3
+
+
+def lidar_frame_suffix(range_map_source: str) -> str:
+    if range_map_source == "converted":
+        return ".lidar_row.npz"
+    return ".lidar_raw.npz"
+
+
+def count_lidar_frames(tar_path: Path, *, range_map_source: str) -> int:
+    suffix = lidar_frame_suffix(range_map_source)
+    with tarfile.open(tar_path, "r") as tar_handle:
+        return sum(1 for name in tar_handle.getnames() if name.endswith(suffix))
+
+
+def list_lidar_sample_keys(lidar_dir: Path, args: argparse.Namespace) -> list[str]:
+    """Enumerate chunk sample keys directly from lidar tar files."""
+
+    if not lidar_dir.exists():
+        raise FileNotFoundError(f"Missing LiDAR directory: {lidar_dir}")
+    sample_keys: list[str] = []
+    for tar_path in sorted(lidar_dir.glob("*.tar")):
+        try:
+            num_frames = count_lidar_frames(tar_path, range_map_source=args.range_map_source)
+        except Exception as exc:
+            print(f"[list][skip] {tar_path}: {exc}", flush=True)
+            continue
+        if num_frames <= 0:
+            continue
+        if num_frames < args.num_frames and not args.pad_last:
+            continue
+        if args.pad_last:
+            max_chunk_index = max((num_frames - 1) // args.lidar_chunk_stride_frames, 0)
+        else:
+            max_chunk_index = max((num_frames - args.num_frames) // args.lidar_chunk_stride_frames, 0)
+        sample_keys.extend(f"{tar_path.stem}_{chunk_index}" for chunk_index in range(max_chunk_index + 1))
+    return sample_keys
 
 
 def load_captions(path: Path) -> dict[str, Any]:
@@ -232,15 +288,15 @@ def prepare_one_sample(
     *,
     args: argparse.Namespace,
     captions: dict[str, Any],
-    raw_lidar_dir: Path,
+    lidar_dir: Path,
     output_dir: Path,
     caption_generator: CaptionGenerator,
 ) -> dict[str, Any]:
     segment_key, chunk_index = split_sample_key(sample_key)
     frame_start = chunk_index * args.lidar_chunk_stride_frames
-    raw_lidar_tar = raw_lidar_dir / f"{segment_key}.tar"
-    if not raw_lidar_tar.exists():
-        raise FileNotFoundError(f"Missing raw LiDAR tar for {sample_key}: {raw_lidar_tar}")
+    lidar_tar = lidar_dir / f"{segment_key}.tar"
+    if not lidar_tar.exists():
+        raise FileNotFoundError(f"Missing {args.range_map_source} LiDAR tar for {sample_key}: {lidar_tar}")
 
     video_out = output_dir / "videos" / f"{sample_key}.mp4"
     layout_out = output_dir / args.layout_folder / f"{sample_key}.mp4"
@@ -252,15 +308,25 @@ def prepare_one_sample(
     needs_raw_lidar = needs_video or needs_layout
 
     if needs_raw_lidar:
-        range_maps, frame_names = load_raw_range_maps(
-            raw_lidar_tar,
-            frame_start=frame_start,
-            num_frames=args.num_frames,
-            pad_last=args.pad_last,
-            n_rows=args.native_n_rows,
-            n_cols=args.native_n_cols,
-            max_projection_range=args.projection_max_range,
-        )
+        if args.range_map_source == "converted":
+            range_maps, frame_names = load_converted_range_maps(
+                lidar_tar,
+                frame_start=frame_start,
+                num_frames=args.num_frames,
+                pad_last=args.pad_last,
+                n_rows=args.native_n_rows,
+                n_cols=args.native_n_cols,
+            )
+        else:
+            range_maps, frame_names = load_raw_range_maps(
+                lidar_tar,
+                frame_start=frame_start,
+                num_frames=args.num_frames,
+                pad_last=args.pad_last,
+                n_rows=args.native_n_rows,
+                n_cols=args.native_n_cols,
+                max_projection_range=args.projection_max_range,
+            )
         tensor, downsampled_range, valid_mask = preprocess_range_maps(range_maps, args)
         frames = normalized_tensor_to_uint8_video(tensor) if needs_video or args.caption_mode == "vlm" else None
         if needs_video:
@@ -296,16 +362,23 @@ def prepare_one_sample(
         "chunk_index": chunk_index,
         "lidar_frame_start": frame_start,
         "lidar_num_frames": args.num_frames,
-        "raw_lidar_tar": str(raw_lidar_tar),
+        "range_map_source": args.range_map_source,
+        "lidar_tar": str(lidar_tar),
         "video_path": str(video_out),
         "rangemap_layout_path": str(layout_out),
         "caption_path": str(caption_out),
         "caption_mode": args.caption_mode,
         "frame_names": frame_names,
         "native_range_shape": [args.num_frames, args.native_n_rows, args.native_n_cols],
-        "target_video_shape": [args.num_frames, args.native_n_rows * args.repeat_row, args.native_n_cols * args.repeat_col, 3],
     }
     if downsampled_range is not None and valid_mask is not None:
+        metadata["downsampled_range_shape"] = list(downsampled_range.shape)
+        metadata["target_video_shape"] = [
+            args.num_frames,
+            downsampled_range.shape[1] * args.repeat_row,
+            downsampled_range.shape[2] * args.repeat_col,
+            3,
+        ]
         metadata["valid_pixel_ratio"] = float(valid_mask.mean())
         valid_values = downsampled_range[valid_mask]
         if valid_values.size:
@@ -319,59 +392,70 @@ def prepare_one_sample(
 
 def main() -> None:
     args = parse_args()
+    apply_source_defaults(args)
     os.environ.setdefault("MPLCONFIGDIR", DEFAULT_MPLCONFIGDIR)
     prepend_lidar_utils_repo(args.lidar_utils_repo)
 
     split_root = Path(args.waymo_chunk_root) / args.split
     control_dir = split_root / "world_scenario" / args.camera
-    raw_lidar_dir = Path(args.raw_waymo_root) / args.split / "lidar_raw"
+    if args.range_map_source == "converted":
+        lidar_dir = Path(args.converted_waymo_root) / args.split / "lidar"
+    else:
+        lidar_dir = Path(args.raw_waymo_root) / args.split / "lidar_raw"
     output_dir = Path(args.output_root) / args.split
     captions = load_captions(Path(args.caption_json_path))
     caption_generator = CaptionGenerator(args)
 
     if args.sample_key:
-        control_paths = [control_dir / f"{args.sample_key}.mp4"]
+        sample_keys = [args.sample_key]
+    elif args.sample_list_source == "lidar":
+        sample_keys = list_lidar_sample_keys(lidar_dir, args)
     else:
         control_paths = sorted(control_dir.glob("*.mp4"))
+        sample_keys = [control_path.stem for control_path in control_paths]
     if args.max_samples is not None:
-        control_paths = control_paths[: args.max_samples]
+        sample_keys = sample_keys[: args.max_samples]
     if args.num_shards < 1:
         raise ValueError(f"--num-shards must be positive, got {args.num_shards}")
     if not 0 <= args.shard_index < args.num_shards:
         raise ValueError(f"--shard-index must be in [0, {args.num_shards}), got {args.shard_index}")
     if args.num_shards > 1:
-        start = len(control_paths) * args.shard_index // args.num_shards
-        end = len(control_paths) * (args.shard_index + 1) // args.num_shards
-        control_paths = control_paths[start:end]
-    if not control_paths:
+        start = len(sample_keys) * args.shard_index // args.num_shards
+        end = len(sample_keys) * (args.shard_index + 1) // args.num_shards
+        sample_keys = sample_keys[start:end]
+    if not sample_keys:
+        if args.sample_list_source == "lidar":
+            raise RuntimeError(f"No LiDAR samples found under {lidar_dir}")
         raise RuntimeError(f"No control videos found under {control_dir}")
 
     written = []
     skipped = 0
-    for idx, control_path in enumerate(control_paths, start=1):
-        sample_key = control_path.stem
+    for idx, sample_key in enumerate(sample_keys, start=1):
         try:
             metadata = prepare_one_sample(
                 sample_key,
                 args=args,
                 captions=captions,
-                raw_lidar_dir=raw_lidar_dir,
+                lidar_dir=lidar_dir,
                 output_dir=output_dir,
                 caption_generator=caption_generator,
             )
             written.append(metadata)
-            print(f"[{idx}/{len(control_paths)}] prepared {sample_key}", flush=True)
+            print(f"[{idx}/{len(sample_keys)}] prepared {sample_key}", flush=True)
         except Exception as exc:
             skipped += 1
-            print(f"[{idx}/{len(control_paths)}] skip {sample_key}: {exc}", flush=True)
+            print(f"[{idx}/{len(sample_keys)}] skip {sample_key}: {exc}", flush=True)
 
     summary = {
         "split": args.split,
         "output_dir": str(output_dir),
         "num_prepared": len(written),
         "num_skipped": skipped,
-        "num_requested": len(control_paths),
+        "num_requested": len(sample_keys),
         "camera": args.camera,
+        "range_map_source": args.range_map_source,
+        "sample_list_source": args.sample_list_source,
+        "lidar_dir": str(lidar_dir),
         "num_frames": args.num_frames,
         "native_n_rows": args.native_n_rows,
         "native_n_cols": args.native_n_cols,

@@ -43,6 +43,18 @@ if TYPE_CHECKING:
 
 def init() -> int | None:
     """Initialize distributed training."""
+
+    def _validate_local_rank(local_rank: int) -> None:
+        if not torch.cuda.is_available():
+            return
+        device_count = torch.cuda.device_count()
+        if local_rank < 0 or local_rank >= device_count:
+            visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", "<unset>")
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is out of range for {device_count} visible CUDA device(s). "
+                f"CUDA_VISIBLE_DEVICES={visible_devices}."
+            )
+
     if dist.is_initialized():
         return torch.cuda.current_device()
 
@@ -53,6 +65,7 @@ def init() -> int | None:
     if rank_env is None:
         local_rank = int(os.getenv("LOCAL_RANK", 0))
         if torch.cuda.is_available():
+            _validate_local_rank(local_rank)
             torch.cuda.set_device(local_rank)
             log.info(f"Running in single GPU mode, initializing distributed with one process on device {local_rank}")
             # Initialize single-process distributed environment for compatibility
@@ -74,6 +87,7 @@ def init() -> int | None:
     # Set GPU affinity.
     pynvml.nvmlInit()
     local_rank = int(os.getenv("LOCAL_RANK", 0))
+    _validate_local_rank(local_rank)
     try:
         device = Device(local_rank)
         os.sched_setaffinity(0, device.get_cpu_affinity())

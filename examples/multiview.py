@@ -22,6 +22,7 @@ from typing import Annotated
 import pydantic
 import tyro
 from cosmos_oss.init import cleanup_environment, init_environment, init_output_dir
+from torch.distributed.elastic.multiprocessing.errors import record
 
 from cosmos_transfer2.config import handle_tyro_exception, is_rank0
 from cosmos_transfer2.multiview_config import (
@@ -48,6 +49,7 @@ class Args(pydantic.BaseModel):
     These can only be provided via the json input file."""
 
 
+@record
 def main(
     args: Args,
 ):

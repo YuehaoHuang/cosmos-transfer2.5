@@ -11,7 +11,7 @@ set -e
 echo "=========================================="
 echo "📥 下载 Cosmos-Transfer2.5 全套权重"
 echo "=========================================="
-# echo "🗂️  缓存目录: $HF_HOME"
+echo "🗂️  缓存目录: ${HF_HOME:-<default ~/.cache/huggingface>}"
 # echo "🌐 镜像站点: $HF_ENDPOINT"
 echo ""
 
@@ -30,6 +30,7 @@ echo "=========================================="
 echo "📦 [1/6] nvidia/Cosmos-Guardrail1"
 echo "=========================================="
 hf download "nvidia/Cosmos-Guardrail1" \
+    --repo-type model \
     --revision "d6d4bfa899a71454a700907664f3e88f503950cf"
 echo "✅ Cosmos-Guardrail1 完成"
 echo ""
@@ -41,26 +42,31 @@ echo "=========================================="
 
 echo "  → Multiview (auto/multiview)"
 hf download "nvidia/Cosmos-Transfer2.5-2B" \
+    --repo-type model \
     --revision "00c591edab119e8a6ca06e6e091351a04ce0ecc9" \
     --include "auto/multiview/*.pt"
 
 echo "  → Edge (general/edge)"
 hf download "nvidia/Cosmos-Transfer2.5-2B" \
+    --repo-type model \
     --revision "b67b64abda3801a9aceddbff2bdb86126c06db74" \
     --include "general/edge/*.pt"
 
 echo "  → Depth (general/depth)"
 hf download "nvidia/Cosmos-Transfer2.5-2B" \
+    --repo-type model \
     --revision "dea7737ca29dd8d9086413c6dc5724b8250a0bb4" \
     --include "general/depth/*.pt"
 
 echo "  → Segmentation (general/seg)"
 hf download "nvidia/Cosmos-Transfer2.5-2B" \
+    --repo-type model \
     --revision "23057a4167b89de89a4a397fdbf3887994d115eb" \
     --include "general/seg/*.pt"
 
 echo "  → Blur (general/blur)"
 hf download "nvidia/Cosmos-Transfer2.5-2B" \
+    --repo-type model \
     --revision "eb5325b77d358944da58a690157dd2b8071bbf85" \
     --include "general/blur/*.pt"
 
@@ -74,11 +80,13 @@ echo "=========================================="
 
 echo "  → Tokenizer"
 hf download "nvidia/Cosmos-Predict2.5-2B" \
+    --repo-type model \
     --revision "6787e176dce74a101d922174a95dba29fa5f0c55" \
-    --include "tokenizer.pth"
+    "tokenizer.pth"
 
 echo "  → Multiview backbone (auto/multiview)"
 hf download "nvidia/Cosmos-Predict2.5-2B" \
+    --repo-type model \
     --revision "865baf084d4c9e850eac59a021277d5a9b9e8b63" \
     --include "auto/multiview/*.pt"
 
@@ -90,6 +98,7 @@ echo "=========================================="
 echo "📦 [4/6] nvidia/Cosmos-Reason1-7B"
 echo "=========================================="
 hf download "nvidia/Cosmos-Reason1-7B" \
+    --repo-type model \
     --revision "3210bec0495fdc7a8d3dbb8d58da5711eab4b423"
 echo "✅ Cosmos-Reason1-7B 完成"
 echo ""
@@ -99,6 +108,7 @@ echo "=========================================="
 echo "📦 [5/6] Qwen/Qwen3Guard-Gen-0.6B"
 echo "=========================================="
 hf download "Qwen/Qwen3Guard-Gen-0.6B" \
+    --repo-type model \
     --revision "fada3b2f655b89601929198343c94cd2f64d93cc"
 echo "✅ Qwen3Guard-Gen-0.6B 完成"
 echo ""
@@ -108,8 +118,22 @@ echo "=========================================="
 echo "📦 [6/6] google/siglip-so400m-patch14-384"
 echo "=========================================="
 hf download "google/siglip-so400m-patch14-384" \
+    --repo-type model \
     --revision "9fdffc58afc957d1a03a25b10dba0329ab15c2a3"
 echo "✅ SigLIP 完成"
+echo ""
+
+# ==================== 7. 离线可用性校验 ====================
+echo "=========================================="
+echo "🔎 [7/7] 关键文件离线校验"
+echo "=========================================="
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 hf download \
+    "nvidia/Cosmos-Predict2.5-2B" \
+    "tokenizer.pth" \
+    --repo-type model \
+    --revision "6787e176dce74a101d922174a95dba29fa5f0c55" \
+    --quiet >/dev/null
+echo "✅ 离线校验通过: nvidia/Cosmos-Predict2.5-2B/tokenizer.pth"
 echo ""
 
 # ==================== 完成 ====================

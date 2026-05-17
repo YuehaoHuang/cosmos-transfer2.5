@@ -14,6 +14,18 @@ WAYMO_SPLIT="training"
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 WAYMO_DATA_ROOT="/data/waymo/inference"
 OFFLINE_MODE=${OFFLINE_MODE:-true}
+PREDICT2_TOKENIZER_REPO="nvidia/Cosmos-Predict2.5-2B"
+PREDICT2_TOKENIZER_REVISION="6787e176dce74a101d922174a95dba29fa5f0c55"
+PREDICT2_TOKENIZER_FILE="tokenizer.pth"
+
+# Prefer visible GPU count from CUDA_VISIBLE_DEVICES. Fall back to nvidia-smi when available.
+VISIBLE_GPU_COUNT=""
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a _CUDA_VISIBLE_GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES// /}"
+    VISIBLE_GPU_COUNT=${#_CUDA_VISIBLE_GPU_ARRAY[@]}
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    VISIBLE_GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
+fi
 
 # ==================== Parse Command Line Arguments ====================
 
@@ -67,6 +79,23 @@ get_spec_name_from_filename() {
     echo "${spec_file%.json}"
 }
 
+check_hf_file_in_offline_cache() {
+    local repo="$1"
+    local revision="$2"
+    local filename="$3"
+    if ! command -v hf >/dev/null 2>&1; then
+        echo "❌ Error: offline mode requires HuggingFace CLI ('hf') to verify local cache, but it was not found."
+        echo "   Install once: uv tool install -U \"huggingface_hub[cli]\""
+        return 1
+    fi
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 hf download \
+        "$repo" \
+        "$filename" \
+        --repo-type model \
+        --revision "$revision" \
+        --quiet >/dev/null 2>&1
+}
+
 # ==================== Check Parameters ====================
 echo "========================================"
 echo "🚀 Cosmos-Transfer2.5 Inference Script (Waymo Autoregressive)"
@@ -75,10 +104,20 @@ echo "📁 Input File:   ${INPUT_FILE:-<Not specified, will iterate through spec
 echo "📂 Output Directory:   $OUTPUT_DIR"
 echo "🧪 Experiment Name:   $EXPERIMENT"
 echo "🎮 Number of GPUs:   $NUM_GPUS"
+if [ -n "$VISIBLE_GPU_COUNT" ]; then
+    echo "🖥️  Visible GPUs:     $VISIBLE_GPU_COUNT"
+    echo "🎯 CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+fi
 echo "🔌 Master Port:     $MASTER_PORT"
 echo "💾 Checkpoint: $CHECKPOINT_PATH"
 echo "📦 Offline Mode:   $OFFLINE_MODE"
 echo "========================================"
+
+if [ -n "$VISIBLE_GPU_COUNT" ] && [ "$NUM_GPUS" -gt "$VISIBLE_GPU_COUNT" ]; then
+    echo "❌ Error: requested --gpus=$NUM_GPUS but only $VISIBLE_GPU_COUNT GPU(s) are visible to this process."
+    echo "   Hint: set --gpus <= visible GPU count, or adjust CUDA_VISIBLE_DEVICES."
+    exit 1
+fi
 
 if [[ "$OFFLINE_MODE" != "true" && "$OFFLINE_MODE" != "false" ]]; then
     echo "❌ Error: --offline must be either true or false"
@@ -104,6 +143,13 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 if [ "$OFFLINE_MODE" = true ]; then
+    # Prefer shared HF cache when available (commonly pre-populated on training/inference servers).
+    if [ -d "/data/huggingface/hub" ]; then
+        export HF_HOME="${HF_HOME:-/data/huggingface}"
+        export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+        echo "📦 Using HuggingFace cache: HF_HOME=$HF_HOME HF_HUB_CACHE=$HF_HUB_CACHE"
+    fi
+
     export HF_HUB_OFFLINE=1
     export TRANSFORMERS_OFFLINE=1
     export HF_DATASETS_OFFLINE=1
@@ -112,12 +158,15 @@ if [ "$OFFLINE_MODE" = true ]; then
     export UV_NO_PROGRESS=1
     echo "📦 Setting offline cache environment variables: HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 UV_OFFLINE=1 UV_NO_PROGRESS=1"
 
-    # Prefer shared HF cache when available (commonly pre-populated on training/inference servers).
-    if [ -d "/data/huggingface/hub" ]; then
-        export HF_HOME="${HF_HOME:-/data/huggingface}"
-        export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
-        echo "📦 Using HuggingFace cache: HF_HOME=$HF_HOME HF_HUB_CACHE=$HF_HUB_CACHE"
+    echo "🔍 Checking required local cache files for offline mode..."
+    if ! check_hf_file_in_offline_cache "$PREDICT2_TOKENIZER_REPO" "$PREDICT2_TOKENIZER_REVISION" "$PREDICT2_TOKENIZER_FILE"; then
+        echo "❌ Error: missing offline cache file: $PREDICT2_TOKENIZER_REPO/$PREDICT2_TOKENIZER_FILE@$PREDICT2_TOKENIZER_REVISION"
+        echo "   Fix A (recommended): run once with --offline false so cache can be populated."
+        echo "   Fix B (manual pre-download):"
+        echo "     hf download \"$PREDICT2_TOKENIZER_REPO\" \"$PREDICT2_TOKENIZER_FILE\" --repo-type model --revision \"$PREDICT2_TOKENIZER_REVISION\""
+        exit 1
     fi
+    echo "✅ Offline cache check passed: $PREDICT2_TOKENIZER_FILE"
 fi
 
 # ==================== Start Inference ====================

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CONDA_ENV="${CONDA_ENV:-cosmos-transfer2.5-merge}"
+CONDA_SH="${CONDA_SH:-/root/miniforge3/etc/profile.d/conda.sh}"
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29731}"
 DATASET_DIR="${DATASET_DIR:-/data2/waymo_singleview_lidar_posttrain/training}"
@@ -98,6 +99,7 @@ if [[ "$USE_TMUX" == "true" && -z "${WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX:-}" ]]; 
     "WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX=1"
     "USE_TMUX=false"
     "CONDA_ENV=$(printf "%q" "$CONDA_ENV")"
+    "CONDA_SH=$(printf "%q" "$CONDA_SH")"
     "NUM_GPUS=$(printf "%q" "$NUM_GPUS")"
     "MASTER_PORT=$(printf "%q" "$MASTER_PORT")"
     "DATASET_DIR=$(printf "%q" "$DATASET_DIR")"
@@ -148,7 +150,7 @@ fi
 export IMAGINAIRE_OUTPUT_ROOT="$OUTPUT_ROOT"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-source /root/miniforge3/etc/profile.d/conda.sh
+source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
 train_args=()
