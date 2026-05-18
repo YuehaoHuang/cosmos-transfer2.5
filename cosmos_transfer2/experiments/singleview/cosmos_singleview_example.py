@@ -162,7 +162,7 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout = dict(
     ),
     scheduler=dict(
         warm_up_steps=[1000],
-        cycle_lengths=[5000],
+        cycle_lengths=[100000],
     ),
     model_parallel=dict(
         context_parallel_size=int(os.environ.get("WORLD_SIZE", "1")),

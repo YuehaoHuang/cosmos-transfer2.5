@@ -15,6 +15,8 @@ STATE_T=8
 MAX_ITER="${MAX_ITER:-5000}"
 SAVE_ITER="${SAVE_ITER:-500}"
 LOGGING_ITER="${LOGGING_ITER:-50}"
+SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}"
+SCHEDULER_CYCLE_LENGTH="${SCHEDULER_CYCLE_LENGTH:-100000}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 USE_TMUX="${USE_TMUX:-true}"
@@ -67,6 +69,14 @@ while [[ $# -gt 0 ]]; do
       LOGGING_ITER="$2"
       shift 2
       ;;
+    --scheduler-warmup-steps)
+      SCHEDULER_WARMUP_STEPS="$2"
+      shift 2
+      ;;
+    --scheduler-cycle-length)
+      SCHEDULER_CYCLE_LENGTH="$2"
+      shift 2
+      ;;
     --num-workers)
       NUM_WORKERS="$2"
       shift 2
@@ -111,6 +121,8 @@ if [[ "$USE_TMUX" == "true" && -z "${WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX:-}" ]]; 
     "MAX_ITER=$(printf "%q" "$MAX_ITER")"
     "SAVE_ITER=$(printf "%q" "$SAVE_ITER")"
     "LOGGING_ITER=$(printf "%q" "$LOGGING_ITER")"
+    "SCHEDULER_WARMUP_STEPS=$(printf "%q" "$SCHEDULER_WARMUP_STEPS")"
+    "SCHEDULER_CYCLE_LENGTH=$(printf "%q" "$SCHEDULER_CYCLE_LENGTH")"
     "WANDB_MODE=$(printf "%q" "$WANDB_MODE")"
     "NUM_WORKERS=$(printf "%q" "$NUM_WORKERS")"
     "DRY_RUN=$(printf "%q" "$DRY_RUN")"
@@ -173,6 +185,8 @@ cmd=(
   "trainer.max_iter=$MAX_ITER"
   "trainer.logging_iter=$LOGGING_ITER"
   "checkpoint.save_iter=$SAVE_ITER"
+  "scheduler.warm_up_steps=[$SCHEDULER_WARMUP_STEPS]"
+  "scheduler.cycle_lengths=[$SCHEDULER_CYCLE_LENGTH]"
   "job.name=$JOB_NAME"
   "job.wandb_mode=$WANDB_MODE"
 )
@@ -188,6 +202,7 @@ fi
 echo "[train] output root: $IMAGINAIRE_OUTPUT_ROOT"
 echo "[train] dataset: $DATASET_DIR"
 echo "[train] experiment: $EXPERIMENT"
+echo "[train] scheduler: warmup=$SCHEDULER_WARMUP_STEPS cycle_length=$SCHEDULER_CYCLE_LENGTH"
 if [[ -n "$LOAD_PATH" ]]; then
   echo "[train] load path: $LOAD_PATH"
 fi
