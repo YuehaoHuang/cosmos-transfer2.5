@@ -5,8 +5,8 @@
 set -e
 
 # 确保环境变量设置
-# export HF_HOME=/data/huggingface
-# export HF_ENDPOINT=https://hf-mirror.com
+export HF_HOME=/team/hyh/huggingface
+export HF_ENDPOINT=https://hf-mirror.com
 
 echo "=========================================="
 echo "📥 下载 Cosmos-Transfer2.5 全套权重"
@@ -16,13 +16,13 @@ echo "🗂️  缓存目录: ${HF_HOME:-<default ~/.cache/huggingface>}"
 echo ""
 
 # 检查是否在 conda 环境中
-if [[ -z "$CONDA_DEFAULT_ENV" ]]; then
-    echo "⚠️  警告: 未检测到 conda 环境，请先激活环境"
-    echo "   运行: conda activate cosmos-transfer2.5-merge"
-    exit 1
-fi
+# if [[ -z "$CONDA_DEFAULT_ENV" ]]; then
+#     echo "⚠️  警告: 未检测到 conda 环境，请先激活环境"
+#     echo "   运行: conda activate cosmos-transfer2.5"
+#     exit 1
+# fi
 
-echo "✅ 当前环境: $CONDA_DEFAULT_ENV"
+# echo "✅ 当前环境: $CONDA_DEFAULT_ENV"
 echo ""
 
 # ==================== 1. Cosmos-Guardrail1 ====================
@@ -81,7 +81,7 @@ echo "=========================================="
 echo "  → Tokenizer"
 hf download "nvidia/Cosmos-Predict2.5-2B" \
     --repo-type model \
-    --revision "6787e176dce74a101d922174a95dba29fa5f0c55" \
+    --revision "f176dc95b4a70f53ce01c4b302851595e7322b00" \
     "tokenizer.pth"
 
 echo "  → Multiview backbone (auto/multiview)"
@@ -131,7 +131,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 hf download \
     "nvidia/Cosmos-Predict2.5-2B" \
     "tokenizer.pth" \
     --repo-type model \
-    --revision "6787e176dce74a101d922174a95dba29fa5f0c55" \
+    --revision "f176dc95b4a70f53ce01c4b302851595e7322b00" \
     --quiet >/dev/null
 echo "✅ 离线校验通过: nvidia/Cosmos-Predict2.5-2B/tokenizer.pth"
 echo ""

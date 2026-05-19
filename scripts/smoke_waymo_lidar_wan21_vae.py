@@ -31,7 +31,7 @@ DEFAULT_LIDAR_UTILS_REPO = "/root/workspace/Cosmos-Drive-Dreams/cosmos-transfer-
 DEFAULT_MPLCONFIGDIR = "/tmp/matplotlib"
 DEFAULT_RAW_LIDAR_ROOT = "/data2/rds_hq_waymo"
 WAN_HF_REPO_CACHE = "models--nvidia--Cosmos-Predict2.5-2B"
-WAN_HF_REVISION = "6787e176dce74a101d922174a95dba29fa5f0c55"
+WAN_HF_REVISION = "f176dc95b4a70f53ce01c4b302851595e7322b00"
 WAN_HF_FILENAME = "tokenizer.pth"
 
 
@@ -337,7 +337,9 @@ def prepend_lidar_utils_repo(repo_path: str) -> None:
         sys.path.insert(0, resolved)
 
 
-def preprocess_range_maps(range_maps: np.ndarray, args: argparse.Namespace) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+def preprocess_range_maps(
+    range_maps: np.ndarray, args: argparse.Namespace
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
     from cosmos_predict1.utils.lidar_rangemap import RangeMapDownsampler, normalize_range_map
 
     downsampler = RangeMapDownsampler(

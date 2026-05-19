@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONDA_ENV="${CONDA_ENV:-cosmos-transfer2.5-merge}"
-CONDA_SH="${CONDA_SH:-/root/miniforge3/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-drivesync}"
+CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29731}"
 DATASET_DIR="${DATASET_DIR:-/data2/waymo_singleview_lidar_posttrain/training}"
@@ -12,9 +12,9 @@ JOB_NAME="${JOB_NAME:-waymo_lidar_singleview_rangemap_layout_t8_$(date +%Y%m%d_%
 LOAD_PATH="${LOAD_PATH:-}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 STATE_T=8
-MAX_ITER="${MAX_ITER:-5000}"
-SAVE_ITER="${SAVE_ITER:-500}"
-LOGGING_ITER="${LOGGING_ITER:-50}"
+MAX_ITER="${MAX_ITER:-100000}"
+SAVE_ITER="${SAVE_ITER:-5000}"
+LOGGING_ITER="${LOGGING_ITER:-500}"
 SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}"
 SCHEDULER_CYCLE_LENGTH="${SCHEDULER_CYCLE_LENGTH:-100000}"
 WANDB_MODE="${WANDB_MODE:-disabled}"

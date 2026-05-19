@@ -2,6 +2,8 @@
 assets/multiview_example1
 data2
 .codex
+waymo
+offline_packages
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

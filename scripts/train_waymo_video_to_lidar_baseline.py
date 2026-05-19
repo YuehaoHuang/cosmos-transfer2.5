@@ -56,7 +56,7 @@ WAYMO_CAMERAS = (
 )
 NORMAL_LIDAR_LATENT_HW = (64, 226)
 WAN_HF_REPO_CACHE = "models--nvidia--Cosmos-Predict2.5-2B"
-WAN_HF_REVISION = "6787e176dce74a101d922174a95dba29fa5f0c55"
+WAN_HF_REVISION = "f176dc95b4a70f53ce01c4b302851595e7322b00"
 WAN_HF_FILENAME = "tokenizer.pth"
 
 
@@ -258,12 +258,16 @@ class OnlineVideoEncoder:
         num_views = len(WAYMO_CAMERAS)
         frames_per_view = view_times_frames // num_views
         video = video.reshape(bsz, channels, num_views, frames_per_view, height, width)
-        latent_frame_ids = torch.linspace(
-            0,
-            frames_per_view - 1,
-            steps=self.args.latent_frames,
-            device=video.device,
-        ).round().long()
+        latent_frame_ids = (
+            torch.linspace(
+                0,
+                frames_per_view - 1,
+                steps=self.args.latent_frames,
+                device=video.device,
+            )
+            .round()
+            .long()
+        )
         video = video.index_select(dim=3, index=latent_frame_ids)
         video = rearrange(video, "b c v t h w -> (b v t) c h w")
         video = F.interpolate(video, size=(90, 160), mode="bilinear", align_corners=False)
