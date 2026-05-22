@@ -16,6 +16,7 @@
 import time
 
 import torch
+import torch.distributed as dist
 import wandb
 from torch import Tensor
 
@@ -44,6 +45,13 @@ class IterSpeed(EveryN):
         self.save_s3_every_log_n = save_s3_every_log_n
         self.name = self.__class__.__name__
         self.last_hit_time = time.time()
+        self.loss_for_log = 0.0
+
+    def _get_loss_for_log(self, loss: torch.Tensor) -> float:
+        loss_for_log = loss.detach().float().clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
+        return loss_for_log.item()
 
     def on_training_step_end(
         self,
@@ -53,11 +61,12 @@ class IterSpeed(EveryN):
         loss: torch.Tensor,
         iteration: int = 0,
     ) -> None:
+        self.loss_for_log = self._get_loss_for_log(loss)
         if self.hit_counter < self.hit_thres:
             log.info(
                 f"Iteration {iteration}: "
                 f"Hit counter: {self.hit_counter + 1}/{self.hit_thres} | "
-                f"Loss: {loss.item():.4f} | "
+                f"Loss: {self.loss_for_log:.4f} | "
                 f"Time: {time.time() - self.last_hit_time:.2f}s"
             )
             self.hit_counter += 1
@@ -83,7 +92,7 @@ class IterSpeed(EveryN):
         cur_time = time.time()
         iter_speed = (cur_time - self.time) / self.every_n / self.step_size
 
-        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}")
+        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {self.loss_for_log:.4f}")
 
         if wandb.run:
             sample_counter = getattr(trainer, "sample_counter", iteration)

@@ -5,10 +5,10 @@ CONDA_ENV="${CONDA_ENV:-drivesync}"
 CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29731}"
-DATASET_DIR="${DATASET_DIR:-/data2/waymo_singleview_lidar_posttrain/training}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/waymo_lidar_singleview_posttrain_output}"
+DATASET_DIR="${DATASET_DIR:-/team/hyh/data/waymo_singleview_lidar_posttrain_from_tokenizer/training}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/team/hyh/code/cosmos-transfer2.5/outputs/waymo_lidar_singleview_posttrain}"
 EXPERIMENT="${EXPERIMENT:-transfer2_singleview_posttrain_waymo_lidar_rangemap_layout}"
-JOB_NAME="${JOB_NAME:-waymo_lidar_singleview_rangemap_layout_t8_$(date +%Y%m%d_%H%M%S)}"
+JOB_NAME="${JOB_NAME:-waymo_lidar_singleview_rangemap_layout_i2v_t8_$(date +%Y%m%d_%H%M%S)}"
 LOAD_PATH="${LOAD_PATH:-}"
 LOAD_TRAINING_STATE="${LOAD_TRAINING_STATE:-false}"
 LEARNING_RATE="${LEARNING_RATE:-}"
@@ -23,7 +23,7 @@ SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}"
 SCHEDULER_CYCLE_LENGTH="${SCHEDULER_CYCLE_LENGTH:-100000}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-USE_TMUX="${USE_TMUX:-true}"
+USE_TMUX="${USE_TMUX:-false}"
 TMUX_SESSION="${TMUX_SESSION:-waymo_lidar_singleview_posttrain_$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-false}"
 
@@ -113,6 +113,10 @@ while [[ $# -gt 0 ]]; do
       TMUX_SESSION="$2"
       shift 2
       ;;
+    --tmux)
+      USE_TMUX=true
+      shift
+      ;;
     --no-tmux)
       USE_TMUX=false
       shift
@@ -194,6 +198,7 @@ fi
 
 export IMAGINAIRE_OUTPUT_ROOT="$OUTPUT_ROOT"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-65536}"
 
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
