@@ -10,6 +10,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/waymo_lidar_singleview_posttrain_output}"
 EXPERIMENT="${EXPERIMENT:-transfer2_singleview_posttrain_waymo_lidar_rangemap_layout}"
 JOB_NAME="${JOB_NAME:-waymo_lidar_singleview_rangemap_layout_t8_$(date +%Y%m%d_%H%M%S)}"
 LOAD_PATH="${LOAD_PATH:-}"
+LOAD_TRAINING_STATE="${LOAD_TRAINING_STATE:-false}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 STATE_T=8
 MAX_ITER="${MAX_ITER:-100000}"
@@ -55,6 +56,14 @@ while [[ $# -gt 0 ]]; do
     --load-path)
       LOAD_PATH="$2"
       shift 2
+      ;;
+    --load-training-state)
+      LOAD_TRAINING_STATE=true
+      shift
+      ;;
+    --no-load-training-state)
+      LOAD_TRAINING_STATE=false
+      shift
       ;;
     --learning-rate)
       LEARNING_RATE="$2"
@@ -132,6 +141,7 @@ if [[ "$USE_TMUX" == "true" && -z "${WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX:-}" ]]; 
     "EXPERIMENT=$(printf "%q" "$EXPERIMENT")"
     "JOB_NAME=$(printf "%q" "$JOB_NAME")"
     "LOAD_PATH=$(printf "%q" "$LOAD_PATH")"
+    "LOAD_TRAINING_STATE=$(printf "%q" "$LOAD_TRAINING_STATE")"
     "LEARNING_RATE=$(printf "%q" "$LEARNING_RATE")"
     "MAX_ITER=$(printf "%q" "$MAX_ITER")"
     "SAVE_ITER=$(printf "%q" "$SAVE_ITER")"
@@ -223,6 +233,7 @@ cmd=(
 
 if [[ -n "$LOAD_PATH" ]]; then
   cmd+=("checkpoint.load_path=$LOAD_PATH")
+  cmd+=("checkpoint.load_training_state=$LOAD_TRAINING_STATE")
 fi
 
 if [[ -n "$LEARNING_RATE" ]]; then
@@ -238,6 +249,7 @@ echo "[train] sample generation types: $SAMPLE_GENERATION_TYPES"
 echo "[train] scheduler: warmup=$SCHEDULER_WARMUP_STEPS cycle_length=$SCHEDULER_CYCLE_LENGTH"
 if [[ -n "$LOAD_PATH" ]]; then
   echo "[train] load path: $LOAD_PATH"
+  echo "[train] load training state: $LOAD_TRAINING_STATE"
 fi
 if [[ -n "$LEARNING_RATE" ]]; then
   echo "[train] learning rate: $LEARNING_RATE"
