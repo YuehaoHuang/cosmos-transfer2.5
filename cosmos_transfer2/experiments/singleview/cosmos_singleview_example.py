@@ -127,9 +127,9 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout = dict(
     model=dict(
         config=dict(
             hint_keys="rangemap_layout",
-            min_num_conditional_frames=0,
-            max_num_conditional_frames=0,
-            conditional_frames_probs={0: 1.0},
+            min_num_conditional_frames=1,
+            max_num_conditional_frames=1,
+            conditional_frames_probs=None,
             state_t=8,
             base_load_from=None,
             net=dict(
@@ -152,8 +152,8 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout = dict(
             heart_beat=dict(save_s3=False),
             iter_speed=dict(save_s3=False),
             device_monitor=dict(save_s3=False),
-            every_n_sample_reg=dict(save_s3=False, every_n=500),
-            every_n_sample_ema=dict(save_s3=False, every_n=500),
+            every_n_sample_reg=dict(save_s3=False, every_n=10000, generation_types="i2v"),
+            every_n_sample_ema=dict(save_s3=False, every_n=10000, generation_types="i2v"),
             wandb=dict(save_s3=False),
             wandb_10x=dict(save_s3=False),
             dataloader_speed=dict(save_s3=False),

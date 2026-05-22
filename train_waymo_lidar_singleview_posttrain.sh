@@ -15,6 +15,9 @@ STATE_T=8
 MAX_ITER="${MAX_ITER:-100000}"
 SAVE_ITER="${SAVE_ITER:-5000}"
 LOGGING_ITER="${LOGGING_ITER:-500}"
+SAMPLE_ITER="${SAMPLE_ITER:-10000}"
+NUM_CONDITIONAL_FRAMES="${NUM_CONDITIONAL_FRAMES:-1}"
+SAMPLE_GENERATION_TYPES="${SAMPLE_GENERATION_TYPES:-i2v}"
 SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}"
 SCHEDULER_CYCLE_LENGTH="${SCHEDULER_CYCLE_LENGTH:-100000}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
@@ -69,6 +72,18 @@ while [[ $# -gt 0 ]]; do
       LOGGING_ITER="$2"
       shift 2
       ;;
+    --sample-iter)
+      SAMPLE_ITER="$2"
+      shift 2
+      ;;
+    --num-conditional-frames)
+      NUM_CONDITIONAL_FRAMES="$2"
+      shift 2
+      ;;
+    --sample-generation-types)
+      SAMPLE_GENERATION_TYPES="$2"
+      shift 2
+      ;;
     --scheduler-warmup-steps)
       SCHEDULER_WARMUP_STEPS="$2"
       shift 2
@@ -121,6 +136,9 @@ if [[ "$USE_TMUX" == "true" && -z "${WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX:-}" ]]; 
     "MAX_ITER=$(printf "%q" "$MAX_ITER")"
     "SAVE_ITER=$(printf "%q" "$SAVE_ITER")"
     "LOGGING_ITER=$(printf "%q" "$LOGGING_ITER")"
+    "SAMPLE_ITER=$(printf "%q" "$SAMPLE_ITER")"
+    "NUM_CONDITIONAL_FRAMES=$(printf "%q" "$NUM_CONDITIONAL_FRAMES")"
+    "SAMPLE_GENERATION_TYPES=$(printf "%q" "$SAMPLE_GENERATION_TYPES")"
     "SCHEDULER_WARMUP_STEPS=$(printf "%q" "$SCHEDULER_WARMUP_STEPS")"
     "SCHEDULER_CYCLE_LENGTH=$(printf "%q" "$SCHEDULER_CYCLE_LENGTH")"
     "WANDB_MODE=$(printf "%q" "$WANDB_MODE")"
@@ -136,6 +154,11 @@ fi
 
 if ! [[ "$NUM_GPUS" =~ ^[0-9]+$ ]] || (( NUM_GPUS < 1 )); then
   echo "NUM_GPUS must be a positive integer, got: $NUM_GPUS" >&2
+  exit 2
+fi
+
+if ! [[ "$NUM_CONDITIONAL_FRAMES" =~ ^[0-2]$ ]]; then
+  echo "NUM_CONDITIONAL_FRAMES must be one of 0, 1, or 2, got: $NUM_CONDITIONAL_FRAMES" >&2
   exit 2
 fi
 
@@ -185,6 +208,13 @@ cmd=(
   "trainer.max_iter=$MAX_ITER"
   "trainer.logging_iter=$LOGGING_ITER"
   "checkpoint.save_iter=$SAVE_ITER"
+  "model.config.min_num_conditional_frames=$NUM_CONDITIONAL_FRAMES"
+  "model.config.max_num_conditional_frames=$NUM_CONDITIONAL_FRAMES"
+  "model.config.conditional_frames_probs=null"
+  "trainer.callbacks.every_n_sample_reg.every_n=$SAMPLE_ITER"
+  "trainer.callbacks.every_n_sample_ema.every_n=$SAMPLE_ITER"
+  "trainer.callbacks.every_n_sample_reg.generation_types=$SAMPLE_GENERATION_TYPES"
+  "trainer.callbacks.every_n_sample_ema.generation_types=$SAMPLE_GENERATION_TYPES"
   "scheduler.warm_up_steps=[$SCHEDULER_WARMUP_STEPS]"
   "scheduler.cycle_lengths=[$SCHEDULER_CYCLE_LENGTH]"
   "job.name=$JOB_NAME"
@@ -202,6 +232,9 @@ fi
 echo "[train] output root: $IMAGINAIRE_OUTPUT_ROOT"
 echo "[train] dataset: $DATASET_DIR"
 echo "[train] experiment: $EXPERIMENT"
+echo "[train] num conditional frames: $NUM_CONDITIONAL_FRAMES"
+echo "[train] sample iter: $SAMPLE_ITER"
+echo "[train] sample generation types: $SAMPLE_GENERATION_TYPES"
 echo "[train] scheduler: warmup=$SCHEDULER_WARMUP_STEPS cycle_length=$SCHEDULER_CYCLE_LENGTH"
 if [[ -n "$LOAD_PATH" ]]; then
   echo "[train] load path: $LOAD_PATH"

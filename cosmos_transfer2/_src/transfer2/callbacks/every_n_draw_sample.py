@@ -17,7 +17,7 @@ import math
 import os
 from contextlib import nullcontext
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -63,6 +63,12 @@ def convert_to_primitive(value):
 
 
 class EveryNDrawSample(EveryN):
+    GENERATION_TYPE_TO_NUM_CONDITIONAL_FRAMES = {
+        "t2v": 0,
+        "i2v": 1,
+        "v2v": 2,
+    }
+
     def __init__(
         self,
         every_n: int,
@@ -80,6 +86,7 @@ class EveryNDrawSample(EveryN):
         use_negative_prompt: bool = False,
         show_all_frames: bool = False,
         fps: int = 16,
+        generation_types: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__(every_n, step_size)
         self.fix_batch = fix_batch_fp
@@ -97,6 +104,27 @@ class EveryNDrawSample(EveryN):
         self.num_sampling_step = num_sampling_step
         self.rank = distributed.get_rank()
         self.fps = fps
+        self.generation_types = self._parse_generation_types(generation_types)
+
+    def _parse_generation_types(self, generation_types: Optional[Union[str, List[str]]]) -> List[str]:
+        if generation_types is None:
+            return list(self.GENERATION_TYPE_TO_NUM_CONDITIONAL_FRAMES.keys())
+        if isinstance(generation_types, str):
+            generation_types = [item.strip() for item in generation_types.split(",") if item.strip()]
+        else:
+            generation_types = [str(item).strip() for item in generation_types if str(item).strip()]
+
+        invalid_generation_types = [
+            item for item in generation_types if item not in self.GENERATION_TYPE_TO_NUM_CONDITIONAL_FRAMES
+        ]
+        if invalid_generation_types:
+            raise ValueError(
+                f"Unsupported generation_types={invalid_generation_types}. "
+                f"Expected a subset of {list(self.GENERATION_TYPE_TO_NUM_CONDITIONAL_FRAMES)}."
+            )
+        if not generation_types:
+            raise ValueError("generation_types must not be empty.")
+        return generation_types
 
     def on_train_start(self, model: ImaginaireModel, iteration: int = 0) -> None:
         config_job = self.config.job
@@ -288,14 +316,10 @@ class EveryNDrawSample(EveryN):
             )
             data_batch["neg_t5_text_mask"] = data_batch["t5_text_mask"]
 
-        num_conditional_frames_options = {
-            "t2v": 0,
-            "i2v": 1,
-            "v2v": 2,
-        }
         local_path_dict = {}
 
-        for generation_type, num_conditional_frames in num_conditional_frames_options.items():
+        for generation_type in self.generation_types:
+            num_conditional_frames = self.GENERATION_TYPE_TO_NUM_CONDITIONAL_FRAMES[generation_type]
             to_show = []
             data_batch[NUM_CONDITIONAL_FRAMES_KEY] = num_conditional_frames
             for guidance in self.guidance:
@@ -344,7 +368,7 @@ class EveryNDrawSample(EveryN):
 
         # to be determined: which one to return
         if len(local_path_dict) != 0:
-            return local_path_dict["i2v"]
+            return next(iter(local_path_dict.values()))
 
         return None
 
