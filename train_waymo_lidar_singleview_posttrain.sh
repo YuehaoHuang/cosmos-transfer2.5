@@ -23,6 +23,7 @@ SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}"
 SCHEDULER_CYCLE_LENGTH="${SCHEDULER_CYCLE_LENGTH:-100000}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+PIN_MEMORY="${PIN_MEMORY:-false}"
 USE_TMUX="${USE_TMUX:-false}"
 TMUX_SESSION="${TMUX_SESSION:-waymo_lidar_singleview_posttrain_$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-false}"
@@ -105,6 +106,14 @@ while [[ $# -gt 0 ]]; do
       NUM_WORKERS="$2"
       shift 2
       ;;
+    --pin-memory)
+      PIN_MEMORY=true
+      shift
+      ;;
+    --no-pin-memory)
+      PIN_MEMORY=false
+      shift
+      ;;
     --wandb-mode)
       WANDB_MODE="$2"
       shift 2
@@ -157,6 +166,7 @@ if [[ "$USE_TMUX" == "true" && -z "${WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX:-}" ]]; 
     "SCHEDULER_CYCLE_LENGTH=$(printf "%q" "$SCHEDULER_CYCLE_LENGTH")"
     "WANDB_MODE=$(printf "%q" "$WANDB_MODE")"
     "NUM_WORKERS=$(printf "%q" "$NUM_WORKERS")"
+    "PIN_MEMORY=$(printf "%q" "$PIN_MEMORY")"
     "DRY_RUN=$(printf "%q" "$DRY_RUN")"
   )
   tmux new-session -d -s "$TMUX_SESSION" \
@@ -168,6 +178,16 @@ fi
 
 if ! [[ "$NUM_GPUS" =~ ^[0-9]+$ ]] || (( NUM_GPUS < 1 )); then
   echo "NUM_GPUS must be a positive integer, got: $NUM_GPUS" >&2
+  exit 2
+fi
+
+if ! [[ "$NUM_WORKERS" =~ ^[0-9]+$ ]]; then
+  echo "NUM_WORKERS must be a non-negative integer, got: $NUM_WORKERS" >&2
+  exit 2
+fi
+
+if [[ "$PIN_MEMORY" != "true" && "$PIN_MEMORY" != "false" ]]; then
+  echo "PIN_MEMORY must be true or false, got: $PIN_MEMORY" >&2
   exit 2
 fi
 
@@ -220,6 +240,7 @@ cmd=(
   "dataloader_train.dataset.dataset_dir=$DATASET_DIR"
   'dataloader_train.sampler.dataset=${dataloader_train.dataset}'
   "dataloader_train.num_workers=$NUM_WORKERS"
+  "dataloader_train.pin_memory=$PIN_MEMORY"
   "trainer.max_iter=$MAX_ITER"
   "trainer.logging_iter=$LOGGING_ITER"
   "checkpoint.save_iter=$SAVE_ITER"
@@ -251,6 +272,7 @@ echo "[train] experiment: $EXPERIMENT"
 echo "[train] num conditional frames: $NUM_CONDITIONAL_FRAMES"
 echo "[train] sample iter: $SAMPLE_ITER"
 echo "[train] sample generation types: $SAMPLE_GENERATION_TYPES"
+echo "[train] workers: num_workers=$NUM_WORKERS pin_memory=$PIN_MEMORY"
 echo "[train] scheduler: warmup=$SCHEDULER_WARMUP_STEPS cycle_length=$SCHEDULER_CYCLE_LENGTH"
 if [[ -n "$LOAD_PATH" ]]; then
   echo "[train] load path: $LOAD_PATH"
