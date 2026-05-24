@@ -139,7 +139,7 @@ python scripts/prepare_waymo_lidar_singleview_posttrain_dataset.py \
 训练：
 
 ```bash
-./train_waymo_lidar_singleview_posttrain.sh \
+./train_waymo_lidar_singleview_chunked.sh \
   --dataset-dir /data2/waymo_singleview_lidar_posttrain/training
 ```
 

@@ -6,7 +6,7 @@ DATASET_DIR="${DATASET_DIR:-/data2/waymo_singleview_lidar_posttrain/training}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/waymo_lidar_singleview_posttrain_output}"
 LOG_DIR="${LOG_DIR:-/data2/waymo_singleview_lidar_posttrain/logs}"
 TRAIN_GPUS="${TRAIN_GPUS:-4}"
-MAX_ITER="${MAX_ITER:-5000}"
+TOTAL_ITER="${TOTAL_ITER:-5000}"
 SAVE_ITER="${SAVE_ITER:-500}"
 LOGGING_ITER="${LOGGING_ITER:-50}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -49,13 +49,13 @@ if int(summary.get("num_prepared", 0)) <= 0:
 PY
 
 log "launching training: gpus=$TRAIN_GPUS job=$JOB_NAME"
-exec ./train_waymo_lidar_singleview_posttrain.sh \
+exec ./train_waymo_lidar_singleview_chunked.sh \
   --no-tmux \
   --gpus "$TRAIN_GPUS" \
   --dataset-dir "$DATASET_DIR" \
   --output-root "$OUTPUT_ROOT" \
   --job-name "$JOB_NAME" \
-  --max-iter "$MAX_ITER" \
+  --total-iter "$TOTAL_ITER" \
   --save-iter "$SAVE_ITER" \
   --logging-iter "$LOGGING_ITER" \
   --num-workers "$NUM_WORKERS" \

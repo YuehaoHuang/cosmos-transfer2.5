@@ -40,7 +40,7 @@ from cosmos_transfer2._src.predict2.models.video2world_model_rectified_flow impo
     Video2WorldModelRectifiedFlowConfig,
 )
 from cosmos_transfer2._src.transfer2.configs.vid2vid_transfer.defaults.conditioner import ControlVideo2WorldCondition
-from cosmos_transfer2._src.transfer2.datasets.augmentors.control_input import CTRL_HINT_KEYS
+from cosmos_transfer2._src.transfer2.datasets.augmentors.control_input import CTRL_HINT_KEYS, parse_control_hint_keys
 
 IS_PREPROCESSED_KEY = "is_preprocessed"
 
@@ -66,7 +66,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
     def __init__(self, config: ControlVideo2WorldRectifiedFlowConfig, *args, **kwargs):
         self.is_new_training = True
         self.copy_weight_strategy = config.copy_weight_strategy
-        self.hint_keys = ["control_input_" + key for key in config.hint_keys.split("_")]
+        self.hint_keys = parse_control_hint_keys(config.hint_keys)
         super().__init__(config, *args, **kwargs)
         log.info(self.net, rank0_only=True)
 

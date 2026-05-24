@@ -180,7 +180,7 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["model"]
     "freeze_base_model"
 ] = False
 transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["optimizer"] = dict(
-    lr="1.0e-05",
+    lr=1.0e-5,
 )
 transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune["scheduler"].update(
     warm_up_steps=[500],

@@ -564,6 +564,50 @@ CTRL_HINT_KEYS = {
 }
 
 
+def parse_control_hint_keys(hint_keys: str | list[str] | tuple[str, ...]) -> list[str]:
+    """Parse control hint keys while preserving names that contain underscores."""
+    known_hint_key_names = [key.replace("control_input_", "") for key in CTRL_HINT_KEYS]
+    known_hint_key_set = set(known_hint_key_names)
+
+    def normalize(key: str) -> str:
+        key = key.strip().removeprefix("control_input_")
+        if key not in known_hint_key_set:
+            raise ValueError(f"Unsupported control hint key: {key}. Supported keys: {known_hint_key_names}")
+        return f"control_input_{key}"
+
+    if isinstance(hint_keys, str):
+        hint_keys = hint_keys.strip()
+        if not hint_keys:
+            raise ValueError("hint_keys must not be empty")
+
+        hint_key_name = hint_keys.removeprefix("control_input_")
+        if "," in hint_keys:
+            hint_key_names = [item.strip().removeprefix("control_input_") for item in hint_keys.split(",") if item.strip()]
+        elif hint_key_name in known_hint_key_set:
+            hint_key_names = [hint_key_name]
+        else:
+            hint_key_names = []
+            tokens = hint_keys.split("_")
+            index = 0
+            while index < len(tokens):
+                match = None
+                for end_index in range(len(tokens), index, -1):
+                    candidate = "_".join(tokens[index:end_index])
+                    if candidate in known_hint_key_set:
+                        match = candidate
+                        index = end_index
+                        break
+                if match is None:
+                    raise ValueError(f"Could not parse control hint keys: {hint_keys}")
+                hint_key_names.append(match)
+    else:
+        hint_key_names = [str(item).strip().removeprefix("control_input_") for item in hint_keys]
+
+    if not hint_key_names:
+        raise ValueError("hint_keys must not be empty")
+    return [normalize(key) for key in hint_key_names]
+
+
 class AddControlInputComb(Augmentor):
     """
     Add control input to the data dictionary. control input are expanded to 3-channels

@@ -127,6 +127,7 @@ class SingleViewTransferDataset(Dataset):
         hint_key: str | None = "control_input_edge",
         is_train: bool = True,
         caption_type: str = "t2w_qwen2p5_7b",  # Use Qwen2.5-7B caption type
+        decord_num_threads: int | None = None,
         **kwargs,  # Accept extra params for config compatibility (like MultiviewTransferDataset)
     ) -> None:
         super().__init__()
@@ -136,6 +137,11 @@ class SingleViewTransferDataset(Dataset):
         self.resolution = resolution
         self.is_train = is_train
         self.caption_type = caption_type
+        if decord_num_threads is None:
+            decord_num_threads = int(os.environ.get("DECORD_NUM_THREADS", "2"))
+        if decord_num_threads < 1:
+            raise ValueError(f"decord_num_threads must be positive, got: {decord_num_threads}")
+        self.decord_num_threads = decord_num_threads
 
         # Parse control type from hint_key. A None hint_key enables video-only
         # post-training while keeping the same local dataset structure.
@@ -218,6 +224,7 @@ class SingleViewTransferDataset(Dataset):
         log.info(f"  Control type: {self.ctrl_type or 'none'}")
         log.info(f"  Resolution: {resolution}, Video size: {video_size}")
         log.info(f"  Required frames: {self.sequence_length}")
+        log.info(f"  Decord threads: {self.decord_num_threads}")
 
         # Quick validation: check for obviously bad videos (optional, can be slow for large datasets)
         # self._validate_videos()  # Uncomment to pre-filter bad videos at initialization
@@ -271,7 +278,7 @@ class SingleViewTransferDataset(Dataset):
         Returns:
             Tuple of (frames, fps, frame_ids)
         """
-        vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=self.decord_num_threads)
         total_frames = len(vr)
 
         if total_frames < self.sequence_length:
@@ -374,7 +381,7 @@ class SingleViewTransferDataset(Dataset):
         try:
             if self.ctrl_type == "seg":
                 # Load segmentation video (same format as depth)
-                vr = VideoReader(ctrl_path, ctx=cpu(0))
+                vr = VideoReader(ctrl_path, ctx=cpu(0), num_threads=self.decord_num_threads)
                 if len(vr) < frame_ids[-1] + 1:
                     raise ValueError(f"Seg video has fewer frames than RGB video: {ctrl_path}")
 
@@ -396,7 +403,7 @@ class SingleViewTransferDataset(Dataset):
 
             elif self.ctrl_type == "depth":
                 # Load depth video
-                vr = VideoReader(ctrl_path, ctx=cpu(0))
+                vr = VideoReader(ctrl_path, ctx=cpu(0), num_threads=self.decord_num_threads)
                 if len(vr) < frame_ids[-1] + 1:
                     raise ValueError(f"Depth video has fewer frames than RGB video: {ctrl_path}")
 
@@ -411,7 +418,7 @@ class SingleViewTransferDataset(Dataset):
                 del vr
 
             elif self.ctrl_type == "rangemap_layout":
-                vr = VideoReader(ctrl_path, ctx=cpu(0))
+                vr = VideoReader(ctrl_path, ctx=cpu(0), num_threads=self.decord_num_threads)
                 if len(vr) < frame_ids[-1] + 1:
                     raise ValueError(f"Range-map layout control video has fewer frames than target video: {ctrl_path}")
 

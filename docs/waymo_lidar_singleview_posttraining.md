@@ -81,7 +81,7 @@ python scripts/prepare_waymo_lidar_singleview_posttrain_dataset.py \
 注册实验：
 
 ```text
-transfer2_singleview_posttrain_waymo_lidar_rangemap_layout
+transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune
 ```
 
 关键配置：
@@ -90,14 +90,14 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout
 - `state_t=8`
 - `num_frames=29`
 - `hint_keys=rangemap_layout`
-- `min_num_conditional_frames=0`
-- `max_num_conditional_frames=0`
+- `min_num_conditional_frames=1`
+- `max_num_conditional_frames=1`
 - 初始化使用官方 single-view edge checkpoint，作为单分支 control 的最近可用预训练权重
 
 启动：
 
 ```bash
-./train_waymo_lidar_singleview_posttrain.sh
+./train_waymo_lidar_singleview_chunked.sh
 ```
 
 常用覆盖：
@@ -106,9 +106,9 @@ transfer2_singleview_posttrain_waymo_lidar_rangemap_layout
 DATASET_DIR=/data2/waymo_singleview_lidar_posttrain/training \
 OUTPUT_ROOT=/data2/waymo_lidar_singleview_posttrain_output \
 NUM_GPUS=8 \
-MAX_ITER=5000 \
+TOTAL_ITER=5000 \
 SAVE_ITER=500 \
-./train_waymo_lidar_singleview_posttrain.sh
+./train_waymo_lidar_singleview_chunked.sh
 ```
 
 `state_t=8` 要求 GPU 数整除 8，推荐 `1`、`2`、`4`、`8`。只有 7 张 GPU 可见时先用 `--gpus 4`。
@@ -116,10 +116,10 @@ SAVE_ITER=500 \
 Dry run：
 
 ```bash
-USE_TMUX=false ./train_waymo_lidar_singleview_posttrain.sh \
+USE_TMUX=false ./train_waymo_lidar_singleview_chunked.sh \
   --dataset-dir /tmp/waymo_lidar_layout_posttrain_smoke/validation \
   --gpus 1 \
-  --max-iter 1 \
+  --total-iter 1 \
   --save-iter 1 \
   --logging-iter 1 \
   --num-workers 0 \
