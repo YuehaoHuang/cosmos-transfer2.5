@@ -25,6 +25,27 @@ OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT: dict[str, Any] = {
     "crop_mode": "none",
 }
 
+WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT: dict[str, Any] = {
+    "version": "wan21_native64x1280_repeatrow11_v1",
+    "tokenizer": "wan2pt1",
+    "latent_kind": "wan2pt1_vae_latent",
+    "latent_shape": [16, 8, 88, 160],
+    "exact_context_shape": None,
+    "requires_exact_context_for_decode": False,
+    "preprocess_mode": "waymo_top_64x2650",
+    "native_n_rows": 64,
+    "native_n_cols": 1280,
+    "downsample_factor_row": 1,
+    "downsample_factor_col": 1,
+    "repeat_row": 11,
+    "repeat_col": 1,
+    "input_channel_mode": "repeat_depth",
+    "decode_channel_mode": "mean",
+    "wan_spatial_align": 8,
+    "input_height": 704,
+    "input_width": 1280,
+}
+
 WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT: dict[str, Any] = {
     "version": "wan21_native64x1312_repeatrow11_v1",
     "tokenizer": "wan2pt1",
@@ -48,6 +69,9 @@ WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT: dict[str, Any] = {
 
 KNOWN_LIDAR_LATENT_CONTRACTS: dict[str, dict[str, Any]] = {
     OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT["version"]: OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT,
+    WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT[
+        "version"
+    ]: WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT,
     WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT[
         "version"
     ]: WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT,

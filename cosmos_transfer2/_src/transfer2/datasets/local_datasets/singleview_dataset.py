@@ -35,6 +35,7 @@ Example usage:
     )
 """
 
+import argparse
 import json
 import os
 import pickle
@@ -107,6 +108,12 @@ class SingleViewTransferDataset(Dataset):
         └── <control_type>/  (optional for depth/seg/rangemap_layout, computed on-the-fly for edge/vis)
             ├── video1.mp4  (for depth or rangemap_layout)
             └── video1.pickle  (for seg/keypoint)
+        └── rangemap_targets/  (optional cached targets for online VAE encode)
+            ├── video1.npz  (normalized_rangemap: float32[T, H, W])
+            └── video2.npz
+
+    Waymo LiDAR training can instead enumerate samples and build the target and rangemap_layout
+    online from raw LiDAR tar files; no local MP4 manifest is required in that mode.
 
     Args:
         dataset_dir: Base path to the dataset directory
@@ -116,6 +123,13 @@ class SingleViewTransferDataset(Dataset):
         hint_key: Control input type (e.g., "control_input_edge", "control_input_depth")
         is_train: Whether this is for training (affects sampling)
         caption_type: Type of caption to load (default: "t2w_qwen2p5_7b")
+        rangemap_target_folder: Optional folder containing preprocessed lossless range-map targets.
+        rangemap_target_key: Data-batch key used for online target encoding.
+        rangemap_target_repeat_row: Vertical expansion applied to the stored target.
+        expected_rangemap_target_shape: Optional required target video tensor shape (C, T, H, W).
+        raw_rangemap_online: Build Waymo range-map target and rangemap_layout from raw LiDAR tar files at load time.
+        raw_lidar_root: Waymo root containing ``<split>/lidar_raw/*.tar`` for the online path.
+        fallback_caption: Caption returned when no per-sample caption exists.
     """
 
     def __init__(
@@ -128,6 +142,30 @@ class SingleViewTransferDataset(Dataset):
         is_train: bool = True,
         caption_type: str = "t2w_qwen2p5_7b",  # Use Qwen2.5-7B caption type
         decord_num_threads: int | None = None,
+        rangemap_target_folder: str | None = None,
+        rangemap_target_key: str = "rangemap_target",
+        rangemap_target_repeat_row: int = 11,
+        rangemap_target_repeat_col: int = 1,
+        expected_rangemap_target_shape: tuple[int, int, int, int] | None = None,
+        raw_rangemap_online: bool = False,
+        raw_lidar_root: str | None = None,
+        raw_lidar_split: str = "training",
+        lidar_utils_repo: str = "/team/hyh/code/Cosmos-Drive-Dreams/cosmos-transfer-lidargen",
+        lidar_chunk_stride_frames: int = 10,
+        pad_lidar_last: bool = False,
+        native_n_rows: int = 64,
+        native_n_cols: int = 1280,
+        projection_max_range: float = 105.0,
+        downsample_factor_row: int = 1,
+        downsample_factor_col: int = 1,
+        downsample_method: str = "scatter_min",
+        input_channel_mode: str = "repeat_depth",
+        max_range: float = 100.0,
+        min_range: float = 5.0,
+        min_value: float = -1.0,
+        layout_edge_threshold_m: float = 1.0,
+        online_fps: float = 10.0,
+        fallback_caption: str = "a video",
         **kwargs,  # Accept extra params for config compatibility (like MultiviewTransferDataset)
     ) -> None:
         super().__init__()
@@ -142,6 +180,35 @@ class SingleViewTransferDataset(Dataset):
         if decord_num_threads < 1:
             raise ValueError(f"decord_num_threads must be positive, got: {decord_num_threads}")
         self.decord_num_threads = decord_num_threads
+        self.rangemap_target_key = rangemap_target_key
+        self.rangemap_target_repeat_row = rangemap_target_repeat_row
+        self.rangemap_target_repeat_col = rangemap_target_repeat_col
+        self.expected_rangemap_target_shape = (
+            None if expected_rangemap_target_shape is None else tuple(expected_rangemap_target_shape)
+        )
+        self.rangemap_target_dir = None if rangemap_target_folder is None else Path(self.dataset_dir) / rangemap_target_folder
+        if self.rangemap_target_dir is not None and not self.rangemap_target_dir.is_dir():
+            raise FileNotFoundError(f"Range-map target folder does not exist: {self.rangemap_target_dir}")
+        if self.rangemap_target_repeat_row < 1 or self.rangemap_target_repeat_col < 1:
+            raise ValueError("Range-map target repeat factors must be positive")
+        self.raw_rangemap_online = raw_rangemap_online
+        self.raw_lidar_dir = None if raw_lidar_root is None else Path(raw_lidar_root) / raw_lidar_split / "lidar_raw"
+        self.lidar_utils_repo = lidar_utils_repo
+        self.lidar_chunk_stride_frames = lidar_chunk_stride_frames
+        self.pad_lidar_last = pad_lidar_last
+        self.native_n_rows = native_n_rows
+        self.native_n_cols = native_n_cols
+        self.projection_max_range = projection_max_range
+        self.downsample_factor_row = downsample_factor_row
+        self.downsample_factor_col = downsample_factor_col
+        self.downsample_method = downsample_method
+        self.input_channel_mode = input_channel_mode
+        self.max_range = max_range
+        self.min_range = min_range
+        self.min_value = min_value
+        self.layout_edge_threshold_m = layout_edge_threshold_m
+        self.online_fps = online_fps
+        self.fallback_caption = fallback_caption
 
         # Parse control type from hint_key. A None hint_key enables video-only
         # post-training while keeping the same local dataset structure.
@@ -157,9 +224,25 @@ class SingleViewTransferDataset(Dataset):
                 )
             self.ctrl_config = CTRL_TYPE_INFO[self.ctrl_type]
 
-        # Set up directories
-        video_dir = os.path.join(self.dataset_dir, "videos")
-        self.video_paths = sorted([os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(".mp4")])
+        if self.raw_rangemap_online:
+            if self.ctrl_type != "rangemap_layout":
+                raise ValueError("raw_rangemap_online requires hint_key='control_input_rangemap_layout'")
+            if self.rangemap_target_dir is not None:
+                raise ValueError("raw_rangemap_online and rangemap_target_folder are mutually exclusive")
+            if self.raw_lidar_dir is None or not self.raw_lidar_dir.is_dir():
+                raise FileNotFoundError(f"Raw LiDAR tar folder does not exist: {self.raw_lidar_dir}")
+            if self.input_channel_mode != "repeat_depth":
+                raise ValueError("raw_rangemap_online currently requires input_channel_mode='repeat_depth'")
+            if self.lidar_chunk_stride_frames < 1:
+                raise ValueError("lidar_chunk_stride_frames must be positive")
+
+        # Keep synthetic MP4 names for the existing __getitem__ key handling.
+        # In raw-online mode no MP4 is opened; tar files define the sample set.
+        if self.raw_rangemap_online:
+            self.video_paths = [f"{sample_key}.mp4" for sample_key in self._list_online_raw_sample_keys()]
+        else:
+            video_dir = os.path.join(self.dataset_dir, "videos")
+            self.video_paths = sorted([os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(".mp4")])
 
         # Support both "captions/" and "metas/" directories
         self.caption_dir = os.path.join(self.dataset_dir, "captions")
@@ -219,21 +302,151 @@ class SingleViewTransferDataset(Dataset):
         if "text_transform" in self.augmentor:
             raise RuntimeError("text_transform should have been filtered out but is still present!")
 
-        log.info(f"Initialized SingleViewTransferDataset with {len(self.video_paths)} videos")
+        log.info(f"Initialized SingleViewTransferDataset with {len(self.video_paths)} samples")
         log.info(f"  Dataset dir: {self.dataset_dir}")
         log.info(f"  Control type: {self.ctrl_type or 'none'}")
         log.info(f"  Resolution: {resolution}, Video size: {video_size}")
         log.info(f"  Required frames: {self.sequence_length}")
         log.info(f"  Decord threads: {self.decord_num_threads}")
+        if self.rangemap_target_dir is not None:
+            log.info(f"  Online VAE target: {self.rangemap_target_dir} -> {self.rangemap_target_key}")
+            log.info(f"  Expected rangemap target shape: {self.expected_rangemap_target_shape}")
+        if self.raw_rangemap_online:
+            log.info(f"  Online raw LiDAR source: {self.raw_lidar_dir}")
+            log.info(f"  Online raw LiDAR target/control key: {self.rangemap_target_key}")
+            log.info(f"  Expected rangemap target shape: {self.expected_rangemap_target_shape}")
 
         # Quick validation: check for obviously bad videos (optional, can be slow for large datasets)
         # self._validate_videos()  # Uncomment to pre-filter bad videos at initialization
 
     def __str__(self) -> str:
-        return f"SingleViewTransferDataset: {len(self.video_paths)} videos from {self.dataset_dir}"
+        return f"SingleViewTransferDataset: {len(self.video_paths)} samples from {self.dataset_dir}"
 
     def __len__(self) -> int:
         return len(self.video_paths)
+
+    def _list_online_raw_sample_keys(self) -> list[str]:
+        from scripts.prepare_waymo_lidar_singleview_posttrain_dataset import list_lidar_sample_keys
+
+        args = argparse.Namespace(
+            range_map_source="raw",
+            num_frames=self.sequence_length,
+            pad_last=self.pad_lidar_last,
+            lidar_chunk_stride_frames=self.lidar_chunk_stride_frames,
+        )
+        sample_keys = list_lidar_sample_keys(self.raw_lidar_dir, args)
+        if not sample_keys:
+            raise ValueError(f"No raw LiDAR sample windows found in {self.raw_lidar_dir}")
+        return sample_keys
+
+    def _load_rangemap_target(self, video_name: str) -> torch.Tensor:
+        if self.rangemap_target_dir is None:
+            raise RuntimeError("_load_rangemap_target called without rangemap_target_folder")
+        target_path = self.rangemap_target_dir / f"{video_name}.npz"
+        if not target_path.exists():
+            raise FileNotFoundError(f"Missing range-map target: {target_path}")
+        with np.load(target_path, allow_pickle=False) as payload:
+            if "normalized_rangemap" not in payload:
+                raise KeyError(f"Target payload has no 'normalized_rangemap' field: {target_path}")
+            normalized = payload["normalized_rangemap"].astype(np.float32, copy=False)
+            stored_row = int(payload["repeat_row"])
+            stored_col = int(payload["repeat_col"])
+        if (stored_row, stored_col) != (self.rangemap_target_repeat_row, self.rangemap_target_repeat_col):
+            raise ValueError(
+                f"Range-map target repeat mismatch in {target_path}: stored={(stored_row, stored_col)}, "
+                f"configured={(self.rangemap_target_repeat_row, self.rangemap_target_repeat_col)}"
+            )
+        if normalized.ndim != 3:
+            raise ValueError(f"Expected normalized target shape (T, H, W), got {normalized.shape} in {target_path}")
+        if normalized.shape[0] != self.sequence_length:
+            raise ValueError(
+                f"Range-map target has {normalized.shape[0]} frames, expected {self.sequence_length}: {target_path}"
+            )
+        expanded = np.repeat(normalized, self.rangemap_target_repeat_row, axis=1)
+        expanded = np.repeat(expanded, self.rangemap_target_repeat_col, axis=2)
+        target = torch.from_numpy(expanded).unsqueeze(0).repeat(3, 1, 1, 1).contiguous()
+        if self.expected_rangemap_target_shape is not None and tuple(target.shape) != self.expected_rangemap_target_shape:
+            raise ValueError(
+                f"Range-map target shape mismatch in {target_path}: expected {self.expected_rangemap_target_shape}, "
+                f"got {tuple(target.shape)}"
+            )
+        if not torch.isfinite(target).all():
+            raise ValueError(f"Range-map target contains non-finite values: {target_path}")
+        if target.min() < -1.0001 or target.max() > 1.0001:
+            raise ValueError(f"Range-map target is outside normalized [-1, 1] bounds: {target_path}")
+        return target
+
+    def _load_online_raw_rangemap_sample(
+        self, video_name: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, list[int]]:
+        """Project a raw Waymo LiDAR window into target and control tensors."""
+
+        from scripts.prepare_waymo_lidar_singleview_posttrain_dataset import (
+            make_rangemap_layout_video,
+            normalized_tensor_to_uint8_video,
+        )
+        from scripts.smoke_waymo_lidar_wan21_vae import (
+            load_raw_range_maps,
+            prepend_lidar_utils_repo,
+            preprocess_range_maps,
+        )
+
+        segment_key, separator, chunk_id = video_name.rpartition("_")
+        if not separator or not chunk_id.isdigit():
+            raise ValueError(f"Online raw LiDAR sample key must end with an integer chunk index: {video_name}")
+        frame_start = int(chunk_id) * self.lidar_chunk_stride_frames
+        raw_tar = self.raw_lidar_dir / f"{segment_key}.tar"
+        if not raw_tar.exists():
+            raise FileNotFoundError(f"Missing raw LiDAR tar for {video_name}: {raw_tar}")
+
+        preprocess_args = argparse.Namespace(
+            downsample_factor_row=self.downsample_factor_row,
+            downsample_factor_col=self.downsample_factor_col,
+            downsample_method=self.downsample_method,
+            repeat_row=self.rangemap_target_repeat_row,
+            repeat_col=self.rangemap_target_repeat_col,
+            input_channel_mode=self.input_channel_mode,
+            max_range=self.max_range,
+            min_range=self.min_range,
+            min_value=self.min_value,
+        )
+        prepend_lidar_utils_repo(self.lidar_utils_repo)
+        range_maps, _ = load_raw_range_maps(
+            raw_tar,
+            frame_start=frame_start,
+            num_frames=self.sequence_length,
+            pad_last=self.pad_lidar_last,
+            n_rows=self.native_n_rows,
+            n_cols=self.native_n_cols,
+            max_projection_range=self.projection_max_range,
+        )
+        target_batch, downsampled_range, valid_mask = preprocess_range_maps(range_maps, preprocess_args)
+        target = target_batch.squeeze(0).contiguous()
+        if self.expected_rangemap_target_shape is not None and tuple(target.shape) != self.expected_rangemap_target_shape:
+            raise ValueError(
+                f"Online raw LiDAR target shape mismatch for {video_name}: expected "
+                f"{self.expected_rangemap_target_shape}, got {tuple(target.shape)}"
+            )
+        if not torch.isfinite(target).all() or target.min() < -1.0001 or target.max() > 1.0001:
+            raise ValueError(f"Online raw LiDAR target contains invalid normalized values: {video_name}")
+
+        video_frames = normalized_tensor_to_uint8_video(target_batch)
+        video = torch.from_numpy(video_frames).permute(3, 0, 1, 2).contiguous()
+        layout_frames = make_rangemap_layout_video(
+            downsampled_range,
+            valid_mask,
+            repeat_row=self.rangemap_target_repeat_row,
+            repeat_col=self.rangemap_target_repeat_col,
+            edge_threshold_m=self.layout_edge_threshold_m,
+        )
+        layout = torch.from_numpy(layout_frames).permute(3, 0, 1, 2).contiguous()
+        if video.shape != target.shape or layout.shape != target.shape:
+            raise ValueError(
+                f"Online raw LiDAR target/control alignment mismatch for {video_name}: "
+                f"target={tuple(target.shape)}, video={tuple(video.shape)}, layout={tuple(layout.shape)}"
+            )
+        frame_ids = list(range(frame_start, frame_start + self.sequence_length))
+        return video, layout, target, float(self.online_fps), frame_ids
 
     def _validate_videos(self) -> None:
         """Validate all videos and pre-mark bad ones (too short, corrupted, etc.).
@@ -343,8 +556,8 @@ class SingleViewTransferDataset(Dataset):
             except Exception as e:
                 log.warning(f"Failed to load caption from {txt_path}: {e}")
 
-        log.debug(f"No caption found for {video_name}, using generic caption")
-        return "a video"  # Generic fallback caption
+        log.debug(f"No caption found for {video_name}, using fallback caption")
+        return self.fallback_caption
 
     # Captions are now encoded on-the-fly by the model's text encoder (Qwen/reason1p1_7B)
 
@@ -469,15 +682,17 @@ class SingleViewTransferDataset(Dataset):
                 video_path = self.video_paths[index]
                 video_name = os.path.basename(video_path).replace(".mp4", "")
 
-                # Load video frames
-                frames, fps, frame_ids = self._load_video(video_path)
-                frames = frames.astype(np.uint8)
-
-                # Convert to tensor - augmentor will handle resizing and padding
-                # frames: numpy (T, H, W, C) uint8
-                frames_t = torch.from_numpy(frames).permute(0, 3, 1, 2)  # (T, C, H, W) uint8
-                # Permute to (C, T, H, W) format expected by augmentors
-                video = frames_t.permute(1, 0, 2, 3)  # (C, T, H, W) uint8
+                online_rangemap_target = None
+                online_rangemap_layout = None
+                if self.raw_rangemap_online:
+                    video, online_rangemap_layout, online_rangemap_target, fps, frame_ids = (
+                        self._load_online_raw_rangemap_sample(video_name)
+                    )
+                else:
+                    frames, fps, frame_ids = self._load_video(video_path)
+                    frames = frames.astype(np.uint8)
+                    frames_t = torch.from_numpy(frames).permute(0, 3, 1, 2)
+                    video = frames_t.permute(1, 0, 2, 3)
                 aspect_ratio = detect_aspect_ratio((video.shape[3], video.shape[2]))  # (W, H)
 
                 # Build data dictionary
@@ -529,8 +744,11 @@ class SingleViewTransferDataset(Dataset):
                 data["__url__"] = MockUrl(str(self.dataset_dir))
                 data["__key__"] = video_name
 
-                # Load control input data (if pre-computed)
-                ctrl_data = self._load_control_data(video_name, frame_ids)
+                if online_rangemap_layout is not None:
+                    data["rangemap_layout"] = online_rangemap_layout
+                    ctrl_data = None
+                else:
+                    ctrl_data = self._load_control_data(video_name, frame_ids)
                 if ctrl_data is not None:
                     data.update(ctrl_data)
 
@@ -574,6 +792,19 @@ class SingleViewTransferDataset(Dataset):
                     assert data[ctrl_key].shape == data["video"].shape, (
                         f"Control input shape {data[ctrl_key].shape} doesn't match video shape {data['video'].shape}"
                     )
+
+                if online_rangemap_target is not None:
+                    rangemap_target = online_rangemap_target
+                elif self.rangemap_target_dir is not None:
+                    rangemap_target = self._load_rangemap_target(video_name)
+                else:
+                    rangemap_target = None
+                if rangemap_target is not None:
+                    if rangemap_target.shape != data["video"].shape:
+                        raise ValueError(
+                            f"Range-map target {rangemap_target.shape} does not align with control/video {data['video'].shape}"
+                        )
+                    data[self.rangemap_target_key] = rangemap_target
 
                 log.debug(
                     f"Dataset sample ready: video={data['video'].shape} {data['video'].dtype}, "

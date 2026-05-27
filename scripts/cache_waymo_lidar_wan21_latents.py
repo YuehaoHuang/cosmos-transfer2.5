@@ -30,11 +30,11 @@ from smoke_waymo_lidar_wan21_vae import (  # noqa: E402
     preprocess_range_maps,
 )
 from waymo_lidar_latent_contracts import (  # noqa: E402
-    WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT,
+    WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT,
 )
 
 
-WAN21_CONTRACT = WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT
+WAN21_CONTRACT = WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT
 WAN21_CONTRACT_VERSION = str(WAN21_CONTRACT["version"])
 
 
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-frame-start", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=29)
     parser.add_argument("--native-n-rows", type=int, default=64)
-    parser.add_argument("--native-n-cols", type=int, default=1312)
+    parser.add_argument("--native-n-cols", type=int, default=1280)
     parser.add_argument("--projection-max-range", type=float, default=105.0)
     parser.add_argument("--wan-spatial-align", type=int, default=8)
     parser.add_argument("--downsample-factor-row", type=int, default=1)
@@ -137,7 +137,7 @@ def _create_or_validate_video_link(cache_root: Path, video_latent_dir: Path) -> 
 def _validate_pinned_preprocess(args: argparse.Namespace) -> None:
     expected = {
         "native_n_rows": 64,
-        "native_n_cols": 1312,
+        "native_n_cols": 1280,
         "downsample_factor_row": 1,
         "downsample_factor_col": 1,
         "repeat_row": 11,
@@ -165,7 +165,7 @@ def main() -> None:
     if args.paired_cache_root is None:
         args.paired_cache_root = (
             f"/data2/waymo_paired_latents/{args.split}/"
-            "real_video_wan21_lidar_native64x1312_repeatrow11"
+            "real_video_wan21_lidar_native64x1280_repeatrow11"
         )
     if args.output_dir is None:
         args.output_dir = str(Path(args.paired_cache_root) / "lidar")

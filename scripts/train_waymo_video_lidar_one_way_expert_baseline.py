@@ -58,7 +58,7 @@ from waymo_lidar_latent_contracts import (  # noqa: E402
     KNOWN_LIDAR_LATENT_CONTRACTS,
     NORMAL_VIDEO_LATENT_SHAPE,
     OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT,
-    WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT,
+    WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT,
     contract_from_payload,
     lidar_exact_context_shape,
     lidar_latent_hw,
@@ -261,7 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat-row", type=int, default=4)
     parser.add_argument("--repeat-col", type=int, default=1)
     parser.add_argument("--native-n-rows", type=int, default=64)
-    parser.add_argument("--native-n-cols", type=int, default=1312)
+    parser.add_argument("--native-n-cols", type=int, default=1280)
     parser.add_argument("--projection-max-range", type=float, default=105.0)
     parser.add_argument("--wan-spatial-align", type=int, default=8)
     parser.add_argument("--input-channel-mode", default="repeat_depth", choices=["repeat_depth", "concat_inv_depth"])
@@ -415,7 +415,7 @@ class OnlineLidarWan21Encoder:
 
     @staticmethod
     def _validate_pinned_args(args: argparse.Namespace) -> None:
-        expected = WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT
+        expected = WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT
         actual = {
             "native_n_rows": args.native_n_rows,
             "native_n_cols": args.native_n_cols,
@@ -448,7 +448,7 @@ class OnlineLidarWan21Encoder:
         if self.offload_to_cpu:
             _move_wan_tokenizer(self.tokenizer, self.device)
         latents = []
-        expected_shape = tuple(WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT["latent_shape"])
+        expected_shape = tuple(WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT["latent_shape"])
         try:
             for batch_idx, segment_key in enumerate(segment_keys):
                 tar_path = self.raw_lidar_dir / f"{segment_key}.tar"
@@ -920,7 +920,7 @@ def main() -> None:
         else normalize_lidar_latent_contract(
             requested_lidar_contract
             or (
-                WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT
+                WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT
                 if args.lidar_tokenizer == "wan21"
                 else OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT
             )
@@ -938,7 +938,7 @@ def main() -> None:
             )
     if not use_paired_cache:
         expected_online_contract = (
-            WAN21_NATIVE64X1312_REPEATROW11_LIDAR_LATENT_CONTRACT
+            WAN21_NATIVE64X1280_REPEATROW11_LIDAR_LATENT_CONTRACT
             if args.lidar_tokenizer == "wan21"
             else OFFICIAL_LTCV_LIDAR_LATENT_CONTRACT
         )

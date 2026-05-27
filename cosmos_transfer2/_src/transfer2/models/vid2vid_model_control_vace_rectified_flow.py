@@ -56,6 +56,8 @@ class ControlVideo2WorldRectifiedFlowConfig(Video2WorldModelRectifiedFlowConfig)
     )
     hint_keys: str = "_".join([key.replace("control_input_", "") for key in CTRL_HINT_KEYS.keys()])
     use_reference_image: bool = False  # Whether to use reference image as control input
+    online_target_key: str | None = None  # Optional normalized target to encode online instead of reading target MP4.
+    expected_online_target_shape: tuple[int, int, int, int] | None = None
 
 
 class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
@@ -79,7 +81,46 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             assert data_batch[self.input_image_key].dtype == torch.uint8, "Image data is not in uint8 format."
             data_batch[self.input_image_key] = data_batch[self.input_image_key].to(**self.tensor_kwargs) / 127.5 - 1.0
             del data_batch[self.input_data_key]
-        raw_state, latent_state, condition = super().get_data_and_condition(data_batch)
+        if self.config.online_target_key is None:
+            raw_state, latent_state, condition = super().get_data_and_condition(data_batch)
+        else:
+            if self.config.online_target_key not in data_batch:
+                raise KeyError(f"Missing online VAE target key: {self.config.online_target_key}")
+            self._normalize_video_databatch_inplace(data_batch)
+            self._augment_image_dim_inplace(data_batch)
+            if self.is_image_batch(data_batch):
+                raise ValueError("Online video target encoding is not supported for image-only batches")
+            target_state = data_batch[self.config.online_target_key].to(**self.tensor_kwargs).contiguous().float()
+            if target_state.dim() != 5:
+                raise ValueError(
+                    f"Expected batched online target shape (B, C, T, H, W), got {tuple(target_state.shape)}"
+                )
+            expected_shape = self.config.expected_online_target_shape
+            if expected_shape is not None and tuple(target_state.shape[1:]) != tuple(expected_shape):
+                raise ValueError(
+                    "Online target shape mismatch: "
+                    f"expected {tuple(expected_shape)}, got {tuple(target_state.shape[1:])}"
+                )
+            latent_state = self.encode(target_state).contiguous().float()
+            expected_grid = (
+                self.config.state_t,
+                target_state.shape[-2] // self.tokenizer.spatial_compression_factor,
+                target_state.shape[-1] // self.tokenizer.spatial_compression_factor,
+            )
+            if tuple(latent_state.shape[2:]) != expected_grid:
+                raise ValueError(
+                    f"Online encoded target grid {tuple(latent_state.shape[2:])} does not match "
+                    f"state_t and target spatial grid {expected_grid}"
+                )
+            raw_state = target_state
+            condition = self.conditioner(data_batch).edit_data_type(DataType.VIDEO)
+            condition = condition.set_video_condition(
+                gt_frames=latent_state.to(**self.tensor_kwargs),
+                random_min_num_conditional_frames=self.config.min_num_conditional_frames,
+                random_max_num_conditional_frames=self.config.max_num_conditional_frames,
+                num_conditional_frames=data_batch.get(NUM_CONDITIONAL_FRAMES_KEY, None),
+                conditional_frames_probs=self.config.conditional_frames_probs,
+            )
         # Add control conditioning
         latent_control_input = []
         control_weight = data_batch.get("control_weight", [1.0] * len(self.hint_keys))

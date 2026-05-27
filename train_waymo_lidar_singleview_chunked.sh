@@ -5,17 +5,19 @@ CONDA_ENV="${CONDA_ENV:-drivesync}"
 CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29731}"
-DATASET_DIR="${DATASET_DIR:-/team/hyh/data/waymo_singleview_lidar_posttrain_from_tokenizer/training}"
+RAW_LIDAR_ROOT="${RAW_LIDAR_ROOT:-/team/hyh/data/rds_hq_waymo}"
+RAW_LIDAR_SPLIT="${RAW_LIDAR_SPLIT:-training}"
+DATASET_DIR="${DATASET_DIR:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/team/hyh/code/cosmos-transfer2.5/outputs/waymo_lidar_singleview_posttrain}"
-EXPERIMENT="${EXPERIMENT:-transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune}"
-JOB_NAME="${JOB_NAME:-waymo_lidar_singleview_rangemap_layout_fullfinetune_i2v_t8}"
+EXPERIMENT="${EXPERIMENT:-transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune}"
+JOB_NAME="${JOB_NAME:-waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8}"
 LOAD_PATH="${LOAD_PATH:-}"
 LOAD_TRAINING_STATE="${LOAD_TRAINING_STATE:-false}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 STATE_T=8
 TOTAL_ITER="${TOTAL_ITER:-100000}"
 CHUNK_ITER="${CHUNK_ITER:-10000}"
-SAVE_ITER="${SAVE_ITER:-5000}"
+SAVE_ITER="${SAVE_ITER:-1000}"
 LOGGING_ITER="${LOGGING_ITER:-500}"
 SAMPLE_ITER="${SAMPLE_ITER:-5000}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-30}"
@@ -46,7 +48,9 @@ Options:
   --sleep-seconds N           Sleep between chunks. Default: 30.
   --gpus N                    GPUs for torchrun. state_t=8 requires N in 1,2,4,8.
   --master-port PORT          torchrun master port.
-  --dataset-dir DIR           Dataset root containing videos/, rangemap_layout/, captions/.
+  --dataset-dir DIR           Optional root containing captions/ overrides; raw-online needs no MP4 dataset.
+  --raw-lidar-root DIR        Waymo root containing <split>/lidar_raw/*.tar.
+  --raw-lidar-split NAME      Raw LiDAR split, training or validation. Default: training.
   --output-root DIR           Output root for checkpoints and logs.
   --experiment NAME           Hydra experiment name.
   --load-path PATH            Initial checkpoint path when no latest checkpoint exists.
@@ -85,6 +89,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dataset-dir)
       DATASET_DIR="$2"
+      shift 2
+      ;;
+    --raw-lidar-root)
+      RAW_LIDAR_ROOT="$2"
+      shift 2
+      ;;
+    --raw-lidar-split)
+      RAW_LIDAR_SPLIT="$2"
       shift 2
       ;;
     --output-root)
@@ -207,6 +219,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$DATASET_DIR" ]]; then
+  DATASET_DIR="$RAW_LIDAR_ROOT/$RAW_LIDAR_SPLIT"
+fi
+
 require_positive_int() {
   local name="$1"
   local value="$2"
@@ -277,9 +293,13 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-if [[ ! -d "$DATASET_DIR/videos" || ! -d "$DATASET_DIR/rangemap_layout" || ! -d "$DATASET_DIR/captions" ]]; then
-  echo "Dataset is missing videos/, rangemap_layout/, or captions/: $DATASET_DIR" >&2
-  echo "Run scripts/prepare_waymo_lidar_singleview_posttrain_dataset.py first." >&2
+if [[ "$RAW_LIDAR_SPLIT" != "training" && "$RAW_LIDAR_SPLIT" != "validation" ]]; then
+  echo "RAW_LIDAR_SPLIT must be training or validation, got: $RAW_LIDAR_SPLIT" >&2
+  exit 2
+fi
+
+if [[ ! -d "$RAW_LIDAR_ROOT/$RAW_LIDAR_SPLIT/lidar_raw" ]]; then
+  echo "Raw LiDAR tar folder does not exist: $RAW_LIDAR_ROOT/$RAW_LIDAR_SPLIT/lidar_raw" >&2
   exit 1
 fi
 
@@ -292,6 +312,8 @@ if [[ "$USE_TMUX" == "true" && -z "${WAYMO_LIDAR_SINGLEVIEW_INSIDE_TMUX:-}" ]]; 
     "NUM_GPUS=$(printf "%q" "$NUM_GPUS")"
     "MASTER_PORT=$(printf "%q" "$MASTER_PORT")"
     "DATASET_DIR=$(printf "%q" "$DATASET_DIR")"
+    "RAW_LIDAR_ROOT=$(printf "%q" "$RAW_LIDAR_ROOT")"
+    "RAW_LIDAR_SPLIT=$(printf "%q" "$RAW_LIDAR_SPLIT")"
     "OUTPUT_ROOT=$(printf "%q" "$OUTPUT_ROOT")"
     "EXPERIMENT=$(printf "%q" "$EXPERIMENT")"
     "JOB_NAME=$(printf "%q" "$JOB_NAME")"
@@ -380,6 +402,8 @@ run_chunk() {
     --
     "experiment=$EXPERIMENT"
     "dataloader_train.dataset.dataset_dir=$DATASET_DIR"
+    "dataloader_train.dataset.raw_lidar_root=$RAW_LIDAR_ROOT"
+    "dataloader_train.dataset.raw_lidar_split=$RAW_LIDAR_SPLIT"
     'dataloader_train.sampler.dataset=${dataloader_train.dataset}'
     "dataloader_train.num_workers=$NUM_WORKERS"
     "dataloader_train.pin_memory=$PIN_MEMORY"
@@ -426,6 +450,7 @@ next_target_iter
 
 echo "[chunked-train] output root: $IMAGINAIRE_OUTPUT_ROOT"
 echo "[chunked-train] dataset: $DATASET_DIR"
+echo "[chunked-train] raw lidar source: $RAW_LIDAR_ROOT/$RAW_LIDAR_SPLIT/lidar_raw"
 echo "[chunked-train] experiment: $EXPERIMENT"
 echo "[chunked-train] job: $JOB_NAME"
 echo "[chunked-train] latest iter: $latest_iter"

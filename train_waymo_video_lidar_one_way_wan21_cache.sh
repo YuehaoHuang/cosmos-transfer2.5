@@ -19,8 +19,8 @@ FSDP_SHARD_SIZE="${FSDP_SHARD_SIZE:-0}"
 RF_CONVENTION="${RF_CONVENTION:-predict2}"
 RF_TRAIN_TIME_DISTRIBUTION="${RF_TRAIN_TIME_DISTRIBUTION:-logitnormal}"
 RF_SHIFT="${RF_SHIFT:-5.0}"
-LIDAR_LATENT_CONTRACT="${LIDAR_LATENT_CONTRACT:-wan21_native64x1312_repeatrow11_v1}"
-CACHE_DIR="${CACHE_DIR:-/data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1312_repeatrow11}"
+LIDAR_LATENT_CONTRACT="${LIDAR_LATENT_CONTRACT:-wan21_native64x1280_repeatrow11_v1}"
+CACHE_DIR="${CACHE_DIR:-/data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1280_repeatrow11}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/waymo_video_lidar_one_way_expert}"
 RUN_NAME="${RUN_NAME:-real_video_wan21_lidar_lidar${LIDAR_NUM_BLOCKS}_vkv${VIDEO_KV_EVERY_N_LAYERS}_ckpt${CHECKPOINT_LIDAR_BLOCKS}_b${BATCH_SIZE}_${NUM_GPUS}gpu_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}}"
@@ -104,7 +104,7 @@ cmd=(
   --fsdp-shard-size "$FSDP_SHARD_SIZE"
   --lidar-latent-contract "$LIDAR_LATENT_CONTRACT"
   --train-height 88
-  --train-width 164
+  --train-width 160
   --sdpa-backends flash_only
   --cross-frame-rule all
   --rf-convention "$RF_CONVENTION"
@@ -142,7 +142,7 @@ fi
 echo "output_dir=$OUTPUT_DIR"
 echo "cache_dir=$CACHE_DIR"
 echo "num_gpus=$NUM_GPUS batch_size_per_rank=$BATCH_SIZE lidar_num_blocks=$LIDAR_NUM_BLOCKS checkpoint_lidar_blocks=$CHECKPOINT_LIDAR_BLOCKS video_kv_every_n_layers=$VIDEO_KV_EVERY_N_LAYERS init_lidar_from_video=$INIT_LIDAR_FROM_VIDEO distributed_parallelism=$DISTRIBUTED_PARALLELISM fsdp_shard_size=$FSDP_SHARD_SIZE"
-echo "lidar_latent_contract=$LIDAR_LATENT_CONTRACT train_hw=88x164"
+echo "lidar_latent_contract=$LIDAR_LATENT_CONTRACT train_hw=88x160"
 echo "rf_convention=$RF_CONVENTION rf_train_time_distribution=$RF_TRAIN_TIME_DISTRIBUTION rf_shift=$RF_SHIFT"
 printf 'command:'
 printf ' %q' "${cmd[@]}"

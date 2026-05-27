@@ -18,7 +18,7 @@ RF_CONVENTION="${RF_CONVENTION:-predict2}"
 RF_TRAIN_TIME_DISTRIBUTION="${RF_TRAIN_TIME_DISTRIBUTION:-logitnormal}"
 RF_SHIFT="${RF_SHIFT:-5.0}"
 VIDEO_LATENT_DIR="${VIDEO_LATENT_DIR:-/data/waymo/chunk/training/samples}"
-LIDAR_LATENT_CONTRACT="${LIDAR_LATENT_CONTRACT:-wan21_native64x1312_repeatrow11_v1}"
+LIDAR_LATENT_CONTRACT="${LIDAR_LATENT_CONTRACT:-wan21_native64x1280_repeatrow11_v1}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/waymo_video_lidar_one_way_expert}"
 RUN_NAME="${RUN_NAME:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
@@ -117,9 +117,9 @@ cmd=(
   --lidar-num-blocks "$LIDAR_NUM_BLOCKS"
   --video-kv-every-n-layers "$VIDEO_KV_EVERY_N_LAYERS"
   --train-height 88
-  --train-width 164
+  --train-width 160
   --native-n-rows 64
-  --native-n-cols 1312
+  --native-n-cols 1280
   --downsample-factor-row 1
   --downsample-factor-col 1
   --repeat-row 11
@@ -165,7 +165,7 @@ fi
 echo "output_dir=$OUTPUT_DIR"
 echo "video_latent_dir=$VIDEO_LATENT_DIR"
 echo "num_gpus=$NUM_GPUS batch_size_per_rank=$BATCH_SIZE lidar_num_blocks=$LIDAR_NUM_BLOCKS checkpoint_lidar_blocks=$CHECKPOINT_LIDAR_BLOCKS video_kv_every_n_layers=$VIDEO_KV_EVERY_N_LAYERS init_lidar_from_video=$INIT_LIDAR_FROM_VIDEO"
-echo "lidar_tokenizer=wan21-online lidar_latent_contract=$LIDAR_LATENT_CONTRACT train_hw=88x164"
+echo "lidar_tokenizer=wan21-online lidar_latent_contract=$LIDAR_LATENT_CONTRACT train_hw=88x160"
 echo "rf_convention=$RF_CONVENTION rf_train_time_distribution=$RF_TRAIN_TIME_DISTRIBUTION rf_shift=$RF_SHIFT"
 printf 'command:'
 printf ' %q' "${cmd[@]}"

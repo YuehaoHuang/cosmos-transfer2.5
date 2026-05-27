@@ -5,7 +5,7 @@
 ## 目标
 
 本文记录当前使用图像/视频 VAE 对 Waymo TOP LiDAR range map 做 encode/decode 的 smoke-test 路径。
-2026-05-10 之后，29 帧 LiDAR rangemap video 生成训练主线转到官方 single-view post-training 框架，见 `docs/waymo_lidar_singleview_posttraining.md`。本文中的 VAE 结果只作为 rangemap 编码重建参考，不作为训练入口。
+2026-05-26 起，29 帧 LiDAR 训练主线在官方 single-view post-training 框架中读取无损 normalized rangemap，并在线执行本文验证过的 Wan2.1 encode：`[1,3,29,704,1280] -> [1,16,8,88,160]`。训练不再将 rangemap MP4 二次 encode 为 target，见 `docs/waymo_lidar_singleview_posttraining.md`。
 
 当前测试流程：
 
@@ -34,7 +34,7 @@ scripts/smoke_waymo_lidar_wan21_vae.py
 环境：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 ```
 
 ## 固定样本
@@ -45,7 +45,7 @@ conda activate cosmos-transfer2.5-merge
 split: validation
 segment_key: 10203656353524179475_7625_000_7645_000
 frames: 29
-raw lidar tar: /data2/rds_hq_waymo/validation/lidar_raw/10203656353524179475_7625_000_7645_000.tar
+raw lidar tar: /team/hyh/data/rds_hq_waymo/validation/lidar_raw/10203656353524179475_7625_000_7645_000.tar
 ```
 
 ## 当前置顶方案
@@ -54,23 +54,23 @@ raw lidar tar: /data2/rds_hq_waymo/validation/lidar_raw/10203656353524179475_762
 
 推荐预处理：
 
-- 投影 range map：`64x1312`
+- 投影 range map：`64x1280`
 - 不做下采样：`downsample_factor_row=1`，`downsample_factor_col=1`
 - 通道模式：`repeat_depth`
 - 行重复：`repeat_row=11`
-- spatial padding 前的 VAE 逻辑输入：`[1, 3, 29, 704, 1312]`
-- VAE 输入：`[1, 3, 29, 704, 1312]`
-- latent shape：`[1, 16, 8, 88, 164]`
-- spatial tokens：`88 x 164 = 14432`，比视频 latent `90 x 160 = 14400` 多 `0.22%`
+- spatial padding 前的 VAE 逻辑输入：`[1, 3, 29, 704, 1280]`
+- VAE 输入：`[1, 3, 29, 704, 1280]`
+- latent shape：`[1, 16, 8, 88, 160]`
+- spatial tokens：`88 x 160 = 14080`，和当前 Transfer2 single-view `704x1280` latent 网格完全对齐
 - decode 还原：对 3 个 decoded channels 求均值
-- 当前 canonical clip 指标：Range MAE/RMSE 为 `0.8988m/3.3089m`
-- 点云渲染结果：`/data2/waymo_wan_lidar_vae_smoke/validation/exp_native64x1312_repeatrow11_mean_vispcd/point_cloud_front_view_vehicle.mp4`
+- 当前 canonical clip 指标：Range MAE/RMSE 为 `0.9030m/3.3258m`，normalized MSE 为 `0.006233`
+- 点云渲染结果：`/team/hyh/data/waymo_wan_lidar_vae_smoke/validation/exp_native64x1280_repeatrow11_mean_full/point_cloud_front_view_vehicle.mp4`
 
 原因：
 
 - Wan2.1 VAE 面向图像/视频输入，原始 64 条 scan lines 的垂直像素支撑太少；`repeat_row=11` 可以把输入高度提升到 `704`。
-- `1312x11` 的 latent token 数几乎贴近视频 latent 的 `14400`，同时比严格 `14400` 的 `1200x12` 指标更好。
-- 沿着 `14400` 等量线继续压宽到 `960/896/800/720` 后，MAE/RMSE 开始回升；当前甜点在 `1200~1312` 附近。
+- `1280x11` 的 latent spatial grid 是 `88x160`，和当前 LiDAR single-view post-training 的 `704x1280` target/control 直接对齐，不需要宽度 padding 或额外位置编码改动。
+- `1312x11` 的重建指标略好，但 latent width 是 `164`，会偏离官方 single-view 的 `88x160` 主线；当前选择 `1280x11` 是为了训练形状一致性。
 - 对 decode 后的 3 个通道求均值，比只取第 0 通道更好。
 - `concat_inv_depth` 通道策略已经测试过，效果差于直接把 depth 重复到 3 个通道。
 
@@ -79,29 +79,32 @@ raw lidar tar: /data2/rds_hq_waymo/validation/lidar_raw/10203656353524179475_762
 高质量运行，包含 rangemap 视频和 Plotly 点云可视化：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
   --preprocess-mode waymo_top_64x2650 \
+  --raw-lidar-root /team/hyh/data/rds_hq_waymo \
+  --lidar-utils-repo /team/hyh/code/Cosmos-Drive-Dreams/cosmos-transfer-lidargen \
+  --wan-vae-path /team/hyh/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/f176dc95b4a70f53ce01c4b302851595e7322b00/tokenizer.pth \
   --split validation \
   --segment-key 10203656353524179475_7625_000_7645_000 \
   --frame-start 0 \
   --num-frames 29 \
   --device cuda \
-  --native-n-cols 1312 \
+  --native-n-cols 1280 \
   --repeat-row 11 \
   --vis-pcd \
   --pcd-renderer plotly \
   --pcd-camera-view front_view \
   --pcd-display-frame vehicle \
   --pcd-workers 12 \
-  --output-dir /data2/waymo_wan_lidar_vae_smoke/validation/exp_native64x1312_repeatrow11_mean_full
+  --output-dir /team/hyh/data/waymo_wan_lidar_vae_smoke/validation/exp_native64x1280_repeatrow11_mean_full
 ```
 
 置顶方案参数：
 
 ```text
-native_n_cols = 1312
+native_n_cols = 1280
 downsample_factor_row = 1
 downsample_factor_col = 1
 repeat_row = 11
@@ -111,45 +114,46 @@ decode_channel_mode = mean
 wan_spatial_align = 8
 ```
 
-## 生成训练主线：官方 Single-View Layout Control
+## 生成训练主线：Single-View Layout Control 与 Online Wan Encode
 
-当前独立生成 29 帧 LiDAR rangemap video 的训练路径不使用 depth 作为条件，也不和 camera video 联动。数据保持官方 local single-view 结构：
+当前独立生成 29 帧 LiDAR rangemap video 的训练路径不使用 depth 作为条件，也不和 camera video 联动。默认 dataloader 直接枚举 raw tar，在线投影 target 和 layout，再由 Wan VAE 在线 encode target。训练必需输入为：
 
 ```text
-datasets/your_dataset/
-├── videos/
-│   └── *.mp4
-├── captions/
-│   └── *.json
-└── rangemap_layout/
-    └── *.mp4
+/team/hyh/data/rds_hq_waymo/<split>/lidar_raw/
+└── <segment_key>.tar
 ```
 
-准备数据：
+以下数据准备命令仅用于生成调试视频或自定义 caption，不是默认训练前置步骤：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 python scripts/prepare_waymo_lidar_singleview_posttrain_dataset.py \
   --split training \
-  --output-root /data2/waymo_singleview_lidar_posttrain \
+  --output-root /team/hyh/data/waymo_singleview_lidar_posttrain_raw1280 \
+  --raw-waymo-root /team/hyh/data/rds_hq_waymo \
+  --sample-list-source lidar \
+  --range-map-source raw \
+  --native-n-cols 1280 \
+  --repeat-row 11 \
   --caption-mode fixed
 ```
 
 训练：
 
 ```bash
-./train_waymo_lidar_singleview_chunked.sh \
-  --dataset-dir /data2/waymo_singleview_lidar_posttrain/training
+./train_waymo_lidar_singleview_chunked.sh
 ```
+
+训练时默认读取 `/team/hyh/data/rds_hq_waymo/training/lidar_raw/*.tar` 并使用固定 LiDAR caption；`.mp4` 和 `.npz` 不作为默认输入。验证集 smoke 需附加 `--raw-lidar-split validation`。
 
 评估：
 
 ```bash
 python scripts/evaluate_waymo_lidar_rangemap_generation.py \
   --generated-video /path/to/generated.mp4 \
-  --gt-video /data2/waymo_singleview_lidar_posttrain/validation/videos/<sample>.mp4 \
-  --layout-video /data2/waymo_singleview_lidar_posttrain/validation/rangemap_layout/<sample>.mp4
+  --gt-video /team/hyh/data/waymo_singleview_lidar_posttrain_raw1280/validation/videos/<sample>.mp4 \
+  --layout-video /team/hyh/data/waymo_singleview_lidar_posttrain_raw1280/validation/rangemap_layout/<sample>.mp4
 ```
 
 ## 历史记录：在线 Wan2.1 LiDAR VAE
@@ -158,13 +162,13 @@ python scripts/evaluate_waymo_lidar_rangemap_generation.py \
 
 1. video latent 从真实 Wan latent cache 读取：`/data/waymo/chunk/training/samples`
 2. LiDAR 从 `/data2/rds_hq_waymo/training/lidar_raw/<segment_key>.tar` 按同一个 `waymo_lidar_frame_indices` 在线读取 29 帧
-3. 使用本页置顶方案在线 Wan2.1 VAE encode，得到 `16 x 8 x 88 x 164`
+3. 使用本页置顶方案在线 Wan2.1 VAE encode，得到 `16 x 8 x 88 x 160`
 4. 冻结 video DiT，只训练 full 28-layer LiDAR expert；默认从 frozen video DiT 拷贝同名同形状权重初始化
 
 推荐入口：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 NUM_GPUS=7 \
 BATCH_SIZE=1 \
@@ -188,23 +192,23 @@ tmux session: wan21_online_train_20260426_004355
 output_dir: /data2/waymo_video_lidar_one_way_expert/real_video_wan21_online_lidar14_vkv4_cp_b1_7gpu_20260426_004355
 log: /data2/waymo_video_lidar_one_way_expert/real_video_wan21_online_lidar14_vkv4_cp_b1_7gpu_20260426_004355/train.log
 ```
- 无条件的怎么量化生成指标呢，哟啊不还是用layout，想办法生成想视频hdmap那样的rangemap layout吧
+
 ## 历史记录：训练用 Wan2.1 LiDAR latent cache
 
-早期实验曾生成配对 LiDAR latent cache。该流程不属于当前官方 single-view rangemap layout 训练主线，仅作为历史记录保留。
+早期实验曾生成配对 LiDAR latent cache。该流程不属于当前官方 single-view rangemap layout 训练主线，仅作为历史记录保留。当前 cache writer 默认已切到 `wan21_native64x1280_repeatrow11_v1`；旧 `1312` cache 仍可通过 payload contract 读取。
 
 默认输入：
 
 ```text
 video latent: /data/waymo/chunk/training/samples
 raw lidar: /data2/rds_hq_waymo/training/lidar_raw
-paired cache root: /data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1312_repeatrow11
+paired cache root: /data2/waymo_paired_latents/training/real_video_wan21_lidar_native64x1280_repeatrow11
 ```
 
 单样本 smoke：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 CUDA_VISIBLE_DEVICES=0 python scripts/cache_waymo_lidar_wan21_latents.py \
   --split validation \
@@ -219,7 +223,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/cache_waymo_lidar_wan21_latents.py \
 训练集分片生成：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 CUDA_VISIBLE_DEVICES=0 python scripts/cache_waymo_lidar_wan21_latents.py \
   --split training \
@@ -228,7 +232,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/cache_waymo_lidar_wan21_latents.py \
   --device cuda
 ```
 
-2026-04-26 当前补齐任务：
+2026-04-26 旧 `1312` cache 补齐任务：
 
 ```text
 tmux sessions: wan21_train_cache_shards42_20260426_234620_s{0..41}
@@ -309,7 +313,7 @@ video shape: [16, 40, 90, 160]
 对应训练入口：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 LIDAR_NUM_BLOCKS=28 \
 VIDEO_KV_EVERY_N_LAYERS=4 \
@@ -323,7 +327,7 @@ NUM_GPUS=7 \
 FSDP2 opt-in 入口：
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 NUM_GPUS=7 \
 BATCH_SIZE=1 \
@@ -343,6 +347,9 @@ cache 路径只作为加速/复现实验使用。2026-04-26 已停止旧 cache �
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
   --preprocess-mode waymo_top_64x2650 \
+  --raw-lidar-root /team/hyh/data/rds_hq_waymo \
+  --lidar-utils-repo /team/hyh/code/Cosmos-Drive-Dreams/cosmos-transfer-lidargen \
+  --wan-vae-path /team/hyh/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/f176dc95b4a70f53ce01c4b302851595e7322b00/tokenizer.pth \
   --split validation \
   --segment-key 10203656353524179475_7625_000_7645_000 \
   --frame-start 0 \
@@ -457,7 +464,7 @@ CogVideo 脚本参考 `/root/workspace/CogVideo/inference/cli_vae_demo.py`：
 ### CogVideo 命令
 
 ```bash
-conda activate cosmos-transfer2.5-merge
+conda activate drivesync
 
 CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_cogvideo_vae.py \
   --split validation \
@@ -600,6 +607,9 @@ decode_channel_mode = mean
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
   --preprocess-mode waymo_top_64x2650 \
+  --raw-lidar-root /team/hyh/data/rds_hq_waymo \
+  --lidar-utils-repo /team/hyh/code/Cosmos-Drive-Dreams/cosmos-transfer-lidargen \
+  --wan-vae-path /team/hyh/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/f176dc95b4a70f53ce01c4b302851595e7322b00/tokenizer.pth \
   --split validation \
   --segment-key 10203656353524179475_7625_000_7645_000 \
   --frame-start 0 \
@@ -651,7 +661,8 @@ CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
 | 1280 | 6 | `384x1280` | `[1,16,8,48,160]` | 7680 | -46.67% | 1.0287m | 3.7359m | 0.008430 | 1566118 |
 | 1280 | 8 | `512x1280` | `[1,16,8,64,160]` | 10240 | -28.89% | 0.9612m | 3.4978m | 0.007260 | 1566118 |
 | 1280 | 10 | `640x1280` | `[1,16,8,80,160]` | 12800 | -11.11% | 0.9183m | 3.3817m | 0.006548 | 1566118 |
-| 1280 | 12 | `768x1280` | `[1,16,8,96,160]` | 15360 | +6.67% | **0.8912m** | **3.2751m** | **0.006025** | 1566118 |
+| 1280 | 11 | `704x1280` | `[1,16,8,88,160]` | 14080 | -2.22% | **0.9030m** | **3.3258m** | **0.006233** | 1566118 |
+| 1280 | 12 | `768x1280` | `[1,16,8,96,160]` | 15360 | +6.67% | 0.8912m | 3.2751m | 0.006025 | 1566118 |
 | 1024 | 6 | `384x1024` | `[1,16,8,48,128]` | 6144 | -57.33% | 1.0918m | 3.8650m | 0.009045 | 1261856 |
 | 1024 | 12 | `768x1024` | `[1,16,8,96,128]` | 12288 | -14.67% | 0.9493m | 3.3810m | 0.006447 | 1261856 |
 | 1024 | 14 | `896x1024` | `[1,16,8,112,128]` | 14336 | -0.44% | 0.9249m | 3.3477m | 0.006278 | 1261856 |
@@ -677,15 +688,15 @@ CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
 
 结论：
 
-- 置顶方案是 `native_n_cols=1312, repeat_row=11`：latent spatial 是 `88 x 164 = 14432`，只比 `14400` 多 `0.22%`，MAE/RMSE 为 `0.8988m/3.3089m`。
+- 当前训练主线是 `native_n_cols=1280, repeat_row=11`：latent spatial 是 `88 x 160 = 14080`，和 Transfer2 single-view `704x1280` 完全对齐，MAE/RMSE 为 `0.9030m/3.3258m`。
+- 纯 VAE 重建上 `native_n_cols=1312, repeat_row=11` 略好，latent spatial 是 `88 x 164 = 14432`，MAE/RMSE 为 `0.8988m/3.3089m`；它现在作为历史/对照方案保留，不作为默认训练 shape。
 - 如果必须严格等于 `14400` tokens，当前最好的是 `native_n_cols=1200, repeat_row=12`，latent spatial 是 `96 x 150 = 14400`，MAE/RMSE 为 `0.9136m/3.3311m`。
-- 如果只要求 tokens 不要离 `14400` 太远，当前这批实验里 `native_n_cols=1280, repeat_row=12` 最好，latent spatial 是 `96 x 160 = 15360`，比 `14400` 多 `6.67%`，MAE/RMSE 为 `0.8912m/3.2751m`。
 - 如果更看重 tokens 几乎严格贴近 `14400`，`native_n_cols=1024, repeat_row=14` 是 `112 x 128 = 14336`，只少 `0.44%`，MAE/RMSE 为 `0.9249m/3.3477m`。
 - 如果固定 `repeat_row=6`，必须和视频 latent spatial token 数严格对齐时选择 `native_n_cols=2400`，latent spatial 正好是 `48 x 300 = 14400`。
 - 如果固定 `repeat_row=6` 且允许比 `14400` 少 `4%`，`native_n_cols=2304` 在这条 canonical clip 上指标最好，latent spatial 是 `48 x 288 = 13824`。
 - 沿着 `14400` 等量线继续压缩宽度时，`1200~1312` 附近表现最好；继续压到 `960/896/800/720` 后 MAE/RMSE 开始回升。
 - `2304~2400` 比原始 `2650` 更适合当前 `repeat_row=6` 设置：token 更接近视频 latent，同时 MAE/RMSE 也更低。
-- 如果只看这条 clip 的 range error，`native_n_cols=1280` 最低，但它只有 `7680` spatial tokens，比视频 latent 少 `46.67%`，并且 valid pixels 也更少；这更像低分辨率投影下的工程折中，不应和 `2304/2400` 做严格同分辨率比较。
+- 早期固定 `repeat_row=6` 的 sweep 里，`native_n_cols=1280` 指标最低，但它只有 `7680` spatial tokens，比 `14400` 少 `46.67%`；这类低高度配置不作为当前主线。
 - `repeat_row=6` 时输入高度是 `384`。接近 `9:16` 的宽度是 `680/688`，对应 `4080/4128` tokens，比 `14400` 少约 `71%`；它们不适合“latent token 数接近视频”的目标。
 - `512` 是严格 `3:4` 输入比例，即 `384x512`，latent spatial 是 `48 x 64 = 3072`，MAE/RMSE 为 `1.3272m/4.2601m`；低于 `640` 后指标开始持续变差。
 - 这些指标是在不同投影列数各自的 evaluation grid 上计算的；因为有效像素数量不同，它们适合作为工程选型参考，不是严格逐像素同网格比较。
@@ -703,6 +714,6 @@ CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
 
 - 只有在显存和磁盘成本可接受时，再测试 `repeat_row=20` 或 `repeat_row=24`。
 - 默认不保存完整的 `wan_input_tensor.pt` 和 `wan_reconstruction.pt`，以降低输出体积。
-- 在更多 validation segments 上评估同一组配置，再决定是否把 `repeat_row=16` 当作数据集级默认值。
+- 在更多 validation segments 上评估 `native_n_cols=1280, repeat_row=11`，确认数据集级稳定性。
 - 增加 P50/P90/P99 absolute range error 等分位数指标。
 - 增加 masked point-cloud Chamfer 或 nearest-neighbor distance，用于几何层面的比较。

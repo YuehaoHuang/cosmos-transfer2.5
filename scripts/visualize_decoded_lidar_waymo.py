@@ -571,6 +571,54 @@ def label_image(image: np.ndarray, label: str) -> np.ndarray:
     return np.asarray(pil)
 
 
+def local_plotly_visualize_point_cloud(
+    point_cloud: np.ndarray,
+    colors: np.ndarray,
+    *,
+    point_size: float,
+    camera_position: dict[str, Any],
+    width: int,
+    height: int,
+    range: float = 80,
+    opacity: float = 1.0,
+    bgcolor: tuple[float, float, float] = (0, 0, 0),
+) -> np.ndarray:
+    import io
+
+    import plotly.graph_objects as go
+
+    rgb = np.clip(colors, 0.0, 1.0) * 255.0
+    color_strings = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in rgb]
+    trace = go.Scatter3d(
+        x=point_cloud[:, 0],
+        y=point_cloud[:, 1],
+        z=point_cloud[:, 2],
+        mode="markers",
+        marker=dict(size=point_size, color=color_strings, opacity=opacity),
+    )
+    color_str = f"rgba({bgcolor[0]},{bgcolor[1]},{bgcolor[2]})"
+    axis_cfg = dict(
+        range=[-range, range],
+        autorange=False,
+        showbackground=False,
+        showticklabels=False,
+        zeroline=False,
+        visible=False,
+        showgrid=False,
+    )
+    fig = go.Figure(
+        data=[trace],
+        layout=go.Layout(
+            scene=dict(xaxis=axis_cfg, yaxis=axis_cfg, zaxis=axis_cfg, aspectmode="cube", camera=camera_position),
+            paper_bgcolor=color_str,
+            plot_bgcolor=color_str,
+            margin=dict(l=0, r=0, b=0, t=0),
+        ),
+    )
+    buf = io.BytesIO(fig.to_image(format="png", width=width, height=height))
+    return np.asarray(Image.open(buf))[:, :, :3]
+
+
 @lru_cache(maxsize=8)
 def load_reference_plotly_renderer(
     lidar_tokenizer_repo: str,
@@ -579,14 +627,32 @@ def load_reference_plotly_renderer(
     width: int,
     height: int,
 ):
+    camera_positions = {
+        "front_view": {"eye": {"x": -0.3, "y": 0, "z": 0.2}, "center": {"x": 0.1, "y": 0, "z": 0}},
+        "top_down_view": {"eye": {"x": 0, "y": -0.05, "z": 0.5}, "center": {"x": 0, "y": -0.05, "z": 0}},
+    }
+    local_kwargs = {
+        "point_size": 0.3,
+        "camera_position": camera_positions[camera_view],
+        "width": width,
+        "height": height,
+        "range": 100,
+        "bgcolor": (0.0, 0.0, 0.0),
+    }
+
     repo_path = str(Path(lidar_tokenizer_repo).resolve())
     if repo_path not in sys.path:
         sys.path.insert(0, repo_path)
-    from cosmos_predict1.utils.visualize.point_cloud import (  # type: ignore
-        CAMERA_VIEWS as POINT_CLOUD_CAMERA_VIEWS,
-        VIZ_KWARGS,
-        visualize_point_cloud,
-    )
+    try:
+        from cosmos_predict1.utils.visualize.point_cloud import (  # type: ignore
+            CAMERA_VIEWS as POINT_CLOUD_CAMERA_VIEWS,
+            VIZ_KWARGS,
+            visualize_point_cloud,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "open3d":
+            raise
+        return local_plotly_visualize_point_cloud, local_kwargs
 
     camera_key = {
         "front_view": "front_view_1",
@@ -620,10 +686,11 @@ def render_point_cloud_frame_worker(payload: dict[str, Any]) -> tuple[int, np.nd
     frame_idx = payload["frame_idx"]
     gt = payload["gt"]
     pred = payload["pred"]
-    mask = payload["valid_mask"]
+    gt_mask = payload.get("gt_valid_mask", payload["valid_mask"])
+    pred_mask = payload.get("pred_valid_mask", gt_mask)
     frame_rays = payload["ray_directions"]
-    gt_points = frame_rays[mask] * gt[mask, None]
-    pred_points = frame_rays[mask] * pred[mask, None]
+    gt_points = frame_rays[gt_mask] * gt[gt_mask, None]
+    pred_points = frame_rays[pred_mask] * pred[pred_mask, None]
     if payload["display_frame"] == "vehicle":
         gt_points = transform_points_to_vehicle_frame(gt_points)
         pred_points = transform_points_to_vehicle_frame(pred_points)
@@ -703,6 +770,7 @@ def save_point_cloud_video(
     renderer: str,
     lidar_tokenizer_repo: str,
     workers: int,
+    pred_valid_mask: np.ndarray | None = None,
 ) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     actual_renderer = "raster"
@@ -722,17 +790,25 @@ def save_point_cloud_video(
                 raise
             print(f"Plotly point-cloud renderer unavailable, falling back to raster: {exc}", flush=True)
 
+    if pred_valid_mask is None:
+        pred_valid_mask = valid_mask
+    if pred_valid_mask.shape != valid_mask.shape:
+        raise ValueError(f"pred_valid_mask shape {pred_valid_mask.shape} does not match valid_mask {valid_mask.shape}.")
+
     workers = max(1, int(workers))
     payloads: list[dict[str, Any]] = []
     for frame_idx in range(gt.shape[0]):
-        mask = valid_mask[frame_idx]
+        gt_mask = valid_mask[frame_idx]
+        pred_mask = pred_valid_mask[frame_idx]
         frame_rays = ray_directions[frame_idx] if ray_directions.ndim == 4 else ray_directions
         payloads.append(
             {
                 "frame_idx": frame_idx,
                 "gt": gt[frame_idx],
                 "pred": pred[frame_idx],
-                "valid_mask": mask,
+                "valid_mask": gt_mask,
+                "gt_valid_mask": gt_mask,
+                "pred_valid_mask": pred_mask,
                 "ray_directions": frame_rays,
                 "display_frame": display_frame,
                 "camera_view": camera_view,

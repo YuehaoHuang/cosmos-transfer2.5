@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-width", type=int, default=1280)
     parser.add_argument("--edge-threshold-m", type=float, default=1.0)
     parser.add_argument("--valid-min-offset-m", type=float, default=0.25)
+    parser.add_argument("--layout-occupancy-threshold", type=int, default=90)
+    parser.add_argument("--layout-edge-threshold", type=int, default=90)
     parser.add_argument("--decode-channel-mode", default="mean", choices=["first", "mean", "median", "concat_fuse"])
     parser.add_argument("--inv-depth-threshold", type=float, default=20.0)
     parser.add_argument("--max-range", type=float, default=100.0)
@@ -97,8 +99,8 @@ def layout_masks(path: Path, args: argparse.Namespace) -> tuple[np.ndarray, np.n
     frames = read_video_uint8(path)
     sampled = frames[:, args.repeat_row // 2 :: args.repeat_row, args.repeat_col // 2 :: args.repeat_col, :]
     sampled = sampled[:, : args.target_height, : args.target_width, :]
-    occupancy = sampled[..., 0] > 0
-    edges = sampled[..., 1] > 0
+    occupancy = sampled[..., 0] > args.layout_occupancy_threshold
+    edges = sampled[..., 1] > args.layout_edge_threshold
     return occupancy, edges
 
 

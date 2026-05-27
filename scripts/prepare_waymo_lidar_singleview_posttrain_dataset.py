@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare Waymo TOP LiDAR range-map videos for single-view Transfer2 post-training.
+"""Prepare Waymo TOP LiDAR range-map targets for single-view Transfer2 post-training.
 
 The default output layout follows the official local single-view dataset style:
 
     dataset/
-      videos/*.mp4       # LiDAR range-map target videos
+      videos/*.mp4       # Display-only LiDAR range-map videos
       rangemap_layout/*.mp4  # sparse LiDAR layout control videos
+      rangemap_targets/*.npz # Optional lossless cache; raw-online training does not require it
       captions/*.json
 
 Each sample is keyed by the existing Waymo chunk name, e.g.
@@ -58,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--overwrite-layout", action="store_true")
     parser.add_argument("--overwrite-caption", action="store_true")
+    parser.add_argument("--overwrite-target", action="store_true")
+    parser.add_argument("--target-folder", default="rangemap_targets")
+    parser.add_argument("--write-rangemap-targets", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--layout-folder", default="rangemap_layout")
@@ -300,12 +304,14 @@ def prepare_one_sample(
 
     video_out = output_dir / "videos" / f"{sample_key}.mp4"
     layout_out = output_dir / args.layout_folder / f"{sample_key}.mp4"
+    target_out = output_dir / args.target_folder / f"{sample_key}.npz"
     caption_out = output_dir / "captions" / f"{sample_key}.json"
     metadata_out = output_dir / "metadata" / f"{sample_key}.json"
 
     needs_video = args.overwrite or not video_out.exists()
     needs_layout = args.overwrite or args.overwrite_layout or not layout_out.exists()
-    needs_raw_lidar = needs_video or needs_layout
+    needs_target = args.write_rangemap_targets and (args.overwrite or args.overwrite_target or not target_out.exists())
+    needs_raw_lidar = needs_video or needs_layout or needs_target
 
     if needs_raw_lidar:
         if args.range_map_source == "converted":
@@ -329,6 +335,24 @@ def prepare_one_sample(
             )
         tensor, downsampled_range, valid_mask = preprocess_range_maps(range_maps, args)
         frames = normalized_tensor_to_uint8_video(tensor) if needs_video or args.caption_mode == "vlm" else None
+        if needs_target:
+            if args.input_channel_mode != "repeat_depth":
+                raise ValueError("--write-rangemap-targets currently requires --input-channel-mode repeat_depth")
+            normalized_rangemap = tensor[0, 0, :, :: args.repeat_row, :: args.repeat_col].detach().cpu().numpy()
+            expected_shape = (args.num_frames, downsampled_range.shape[1], downsampled_range.shape[2])
+            if normalized_rangemap.shape != expected_shape:
+                raise ValueError(
+                    f"Normalized rangemap base shape mismatch: expected {expected_shape}, got {normalized_rangemap.shape}"
+                )
+            target_out.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                target_out,
+                normalized_rangemap=normalized_rangemap.astype(np.float32),
+                repeat_row=np.int32(args.repeat_row),
+                repeat_col=np.int32(args.repeat_col),
+                input_channel_mode=np.asarray(args.input_channel_mode),
+                expanded_shape=np.asarray(tensor.shape[1:], dtype=np.int64),
+            )
         if needs_video:
             write_video(video_out, frames, fps=args.fps)
         if needs_layout:
@@ -366,6 +390,7 @@ def prepare_one_sample(
         "lidar_tar": str(lidar_tar),
         "video_path": str(video_out),
         "rangemap_layout_path": str(layout_out),
+        "rangemap_target_path": str(target_out) if args.write_rangemap_targets else None,
         "caption_path": str(caption_out),
         "caption_mode": args.caption_mode,
         "frame_names": frame_names,
@@ -373,6 +398,14 @@ def prepare_one_sample(
     }
     if downsampled_range is not None and valid_mask is not None:
         metadata["downsampled_range_shape"] = list(downsampled_range.shape)
+        if args.write_rangemap_targets:
+            metadata["rangemap_target_base_shape"] = [args.num_frames, *list(downsampled_range.shape[1:])]
+            metadata["rangemap_target_expanded_shape"] = [
+                3,
+                args.num_frames,
+                downsampled_range.shape[1] * args.repeat_row,
+                downsampled_range.shape[2] * args.repeat_col,
+            ]
         metadata["target_video_shape"] = [
             args.num_frames,
             downsampled_range.shape[1] * args.repeat_row,
@@ -459,6 +492,8 @@ def main() -> None:
         "num_frames": args.num_frames,
         "native_n_rows": args.native_n_rows,
         "native_n_cols": args.native_n_cols,
+        "target_folder": args.target_folder,
+        "write_rangemap_targets": args.write_rangemap_targets,
         "repeat_row": args.repeat_row,
         "repeat_col": args.repeat_col,
         "layout_folder": args.layout_folder,

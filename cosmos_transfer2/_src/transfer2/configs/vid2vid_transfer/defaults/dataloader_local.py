@@ -158,6 +158,52 @@ def register_dataloader_local() -> None:
         ),
     )
 
+    # Waymo TOP LiDAR projected from raw tar files and encoded online by Wan2.1 during training.
+    dataset_rangemap_layout_wan21_online = L(SingleViewTransferDataset)(
+        dataset_dir="/team/hyh/data/rds_hq_waymo/training",
+        num_frames=29,
+        video_size=(704, 1280),
+        resolution="720",
+        hint_key="control_input_rangemap_layout",
+        is_train=True,
+        caption_type="t2w_qwen2p5_7b",
+        raw_rangemap_online=True,
+        raw_lidar_root="/team/hyh/data/rds_hq_waymo",
+        raw_lidar_split="training",
+        lidar_utils_repo="/team/hyh/code/Cosmos-Drive-Dreams/cosmos-transfer-lidargen",
+        lidar_chunk_stride_frames=10,
+        native_n_rows=64,
+        native_n_cols=1280,
+        projection_max_range=105.0,
+        downsample_factor_row=1,
+        downsample_factor_col=1,
+        downsample_method="scatter_min",
+        input_channel_mode="repeat_depth",
+        max_range=100.0,
+        min_range=5.0,
+        min_value=-1.0,
+        layout_edge_threshold_m=1.0,
+        fallback_caption="A monochrome LiDAR range-map video.",
+        rangemap_target_key="rangemap_target",
+        rangemap_target_repeat_row=11,
+        rangemap_target_repeat_col=1,
+        expected_rangemap_target_shape=(3, 29, 704, 1280),
+    )
+
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="example_singleview_train_data_rangemap_layout_wan21_online",
+        node=L(get_generic_dataloader)(
+            dataset=dataset_rangemap_layout_wan21_online,
+            sampler=L(get_sampler)(dataset=dataset_rangemap_layout_wan21_online) if dist.is_initialized() else None,
+            batch_size=1,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+        ),
+    )
+
     # Waymo TOP LiDAR range-map video-only domain post-training.
     dataset_rangemap_video = L(SingleViewTransferDataset)(
         dataset_dir="PLACEHOLDER_UPDATE_DATASET_PATH",
