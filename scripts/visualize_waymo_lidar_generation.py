@@ -19,12 +19,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-
 from evaluate_waymo_lidar_rangemap_generation import layout_masks, video_to_range
+from smoke_waymo_lidar_wan21_vae import load_raw_range_maps, make_downsampled_ray_directions, prepend_lidar_utils_repo
 from visualize_decoded_lidar_waymo import (
-    load_raw_gt_for_decoded_crop,
-    make_waymo_top_elevation_angles_128,
-    range_map_to_ray_directions_cropped,
     save_point_cloud_video,
     transform_points_to_vehicle_frame,
     valid_range_mask,
@@ -34,9 +31,15 @@ from visualize_decoded_lidar_waymo import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generated-video", required=True, help="Generated rangemap mp4 from Transfer2 inference.")
-    parser.add_argument("--gt-video", default=None, help="Optional GT rangemap mp4. If omitted, try metadata/dataset/raw tar.")
+    parser.add_argument(
+        "--gt-video", default=None, help="Optional GT rangemap mp4. If omitted, try metadata/dataset/raw tar."
+    )
     parser.add_argument("--layout-video", default=None, help="Optional rangemap_layout mp4 used to build valid mask.")
-    parser.add_argument("--metadata-json", default=None, help="Optional inference metadata JSON. Defaults to same stem as generated mp4.")
+    parser.add_argument(
+        "--metadata-json",
+        default=None,
+        help="Optional inference metadata JSON. Defaults to same stem as generated mp4.",
+    )
     parser.add_argument("--dataset-dir", default=None, help="Dataset dir containing videos/ and rangemap_layout/.")
     parser.add_argument("--sample-key", default=None, help="Dataset sample key. Inferred from metadata when possible.")
     parser.add_argument("--output-dir", default=None)
@@ -64,23 +67,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generated-valid-mode",
         default="predicted",
-        choices=["predicted", "matched_gt"],
-        help="predicted renders generated points from decoded generated occupancy; matched_gt reuses GT/layout occupancy.",
+        choices=["predicted", "matched_gt", "layout"],
+        help=(
+            "predicted renders generated points from decoded generated occupancy; "
+            "matched_gt reuses GT occupancy; layout reuses the layout control occupancy."
+        ),
     )
     parser.add_argument("--layout-occupancy-threshold", type=int, default=90)
     parser.add_argument("--layout-edge-threshold", type=int, default=90)
 
-    parser.add_argument("--raw-lidar-root", default="/team/hyh/data/rds_hq_waymo/lidar_tokenizer")
+    parser.add_argument("--raw-lidar-root", default="/team/hyh/data/rds_hq_waymo")
     parser.add_argument("--split", default="training", choices=["training", "validation"])
     parser.add_argument("--segment-key", default=None)
     parser.add_argument("--lidar-frame-indices", default=None, help="Comma-separated raw LiDAR frame indices.")
     parser.add_argument("--lidar-chunk-stride-frames", type=int, default=10)
     parser.add_argument("--pad-lidar-last", action="store_true")
     parser.add_argument("--use-raw-rays", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--downsample-factor-row", type=int, default=2)
-    parser.add_argument("--downsample-factor-col", type=int, default=3)
+    parser.add_argument("--native-n-rows", type=int, default=64)
+    parser.add_argument("--native-n-cols", type=int, default=1280)
+    parser.add_argument("--projection-max-range", type=float, default=105.0)
+    parser.add_argument("--downsample-factor-row", type=int, default=1)
+    parser.add_argument("--downsample-factor-col", type=int, default=1)
     parser.add_argument("--downsample-method", default="scatter_min", choices=["scatter_min", "scatter_max", "every_n"])
-    parser.add_argument("--full-width", type=int, default=3600)
+    parser.add_argument("--full-width", type=int, default=1280)
     parser.add_argument("--crop-mode", default="none", choices=["center", "left", "none"])
 
     parser.add_argument("--vis-pcd", action=argparse.BooleanOptionalAction, default=True)
@@ -95,7 +104,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-label", default="GT")
     parser.add_argument("--prediction-label", default="generated")
     parser.add_argument("--save-ply", action="store_true", help="Also write generated point clouds as ASCII PLY files.")
-    parser.add_argument("--ply-max-points", type=int, default=0, help="Deterministic cap per frame; 0 keeps all valid points.")
+    parser.add_argument(
+        "--ply-max-points", type=int, default=0, help="Deterministic cap per frame; 0 keeps all valid points."
+    )
     return parser.parse_args()
 
 
@@ -161,66 +172,53 @@ def decode_video(path: Path, args: argparse.Namespace) -> np.ndarray:
     return clip_shape(video_to_range(path, args), args)
 
 
-def fallback_ray_directions(args: argparse.Namespace, *, target_shape: tuple[int, int, int]) -> np.ndarray:
-    _frames, height, width = target_shape
-    elevations = make_waymo_top_elevation_angles_128()
-    raw_rays, _ = range_map_to_ray_directions_cropped(
-        args.full_width,
-        elevations,
-        full_width=args.full_width,
-        crop_mode="none",
+def load_mainline_raw_gt_and_rays(
+    args: argparse.Namespace,
+    *,
+    sample_key: str,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if args.downsample_factor_row != 1 or args.downsample_factor_col != 1:
+        raise ValueError("Raw-online point-cloud visualization requires downsample factors row=1 and col=1.")
+    if args.lidar_frame_indices:
+        frame_indices = [int(value) for value in args.lidar_frame_indices.split(",") if value.strip()]
+        if not frame_indices or frame_indices != list(range(frame_indices[0], frame_indices[0] + n_frames)):
+            raise ValueError("--lidar-frame-indices must specify one contiguous generated window")
+        frame_start = frame_indices[0]
+    else:
+        _segment_key, separator, chunk_id = sample_key.rpartition("_")
+        if not separator or not chunk_id.isdigit():
+            raise ValueError(f"Raw-online sample key must end with a numeric chunk index: {sample_key}")
+        frame_start = int(chunk_id) * args.lidar_chunk_stride_frames
+    segment_key = args.segment_key or sample_key.rpartition("_")[0]
+    tar_path = Path(args.raw_lidar_root) / args.split / "lidar_raw" / f"{segment_key}.tar"
+    prepend_lidar_utils_repo(args.lidar_tokenizer_repo)
+    raw_range, _ = load_raw_range_maps(
+        tar_path,
+        frame_start=frame_start,
+        num_frames=n_frames,
+        pad_last=args.pad_lidar_last,
+        n_rows=args.native_n_rows,
+        n_cols=args.native_n_cols,
+        max_projection_range=args.projection_max_range,
     )
-
-    row_factor = max(1, args.downsample_factor_row)
-    col_factor = max(1, args.downsample_factor_col)
-    usable_rows = (raw_rays.shape[0] // row_factor) * row_factor
-    usable_cols = (raw_rays.shape[1] // col_factor) * col_factor
-    raw_rays = raw_rays[:usable_rows, :usable_cols]
-    rays = raw_rays.reshape(
-        usable_rows // row_factor,
-        row_factor,
-        usable_cols // col_factor,
-        col_factor,
-        3,
-    ).mean(axis=(1, 3))
-    norm = np.linalg.norm(rays, axis=-1, keepdims=True)
-    rays = rays / np.clip(norm, 1e-8, None)
-
-    if rays.shape[0] < height or rays.shape[1] < width:
-        raise ValueError(f"Fallback rays {rays.shape[:2]} are smaller than target {(height, width)}.")
-    if args.crop_mode == "left" or width == rays.shape[1]:
-        start = 0
-    elif args.crop_mode == "center":
-        start = max(0, (rays.shape[1] - width) // 2)
-    else:
-        start = 0
-    return rays[:height, start : start + width].astype(np.float32, copy=False)
-
-
-def build_raw_helper_args(args: argparse.Namespace) -> SimpleNamespace:
+    expected_shape = (args.target_height, args.target_width)
+    if tuple(raw_range.shape[1:]) != expected_shape:
+        raise ValueError(f"Raw projected GT shape {raw_range.shape[1:]} does not match expected {expected_shape}")
     if args.raw_valid_mode == "preprocess":
-        # Match dataset preparation: layout occupancy is downsampled_range > 0.
-        near_buffer = -args.min_range
-        far_buffer = -1.0e6
+        valid_mask = raw_range > 0
     else:
-        near_buffer = args.near_buffer
-        far_buffer = args.far_buffer
-
-    return SimpleNamespace(
-        raw_lidar_root=args.raw_lidar_root,
-        split=args.split,
-        segment_key=args.segment_key,
-        lidar_frame_indices=args.lidar_frame_indices,
-        lidar_chunk_stride_frames=args.lidar_chunk_stride_frames,
-        pad_lidar_last=args.pad_lidar_last,
-        min_range=args.min_range,
-        max_range=args.max_range,
-        near_buffer=near_buffer,
-        far_buffer=far_buffer,
-        downsample_factor_row=args.downsample_factor_row,
-        downsample_factor_col=args.downsample_factor_col,
+        valid_mask = valid_range_mask(raw_range, args.min_range, args.max_range, args.near_buffer, args.far_buffer)
+    ray_args = SimpleNamespace(
+        downsample_factor_row=1,
+        downsample_factor_col=1,
         downsample_method=args.downsample_method,
-        crop_mode=args.crop_mode,
+    )
+    rays = make_downsampled_ray_directions(raw_range, ray_args)
+    return (
+        raw_range.astype(np.float32, copy=False),
+        valid_mask.astype(bool, copy=False),
+        rays.astype(np.float32, copy=False),
     )
 
 
@@ -231,28 +229,22 @@ def resolve_gt_mask_and_rays(
     generated_range: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     sample_key = resolved["sample_key"]
-    if args.use_raw_rays and sample_key:
-        try:
-            raw_gt, raw_valid, raw_rays, _meta = load_raw_gt_for_decoded_crop(
-                build_raw_helper_args(args),
-                sample_key=str(sample_key),
-                n_frames=generated_range.shape[0],
-                decoded_width=generated_range.shape[-1],
-            )
-            raw_gt = clip_shape(raw_gt, args)
-            raw_valid = clip_shape(raw_valid, args).astype(bool)
-            raw_rays = raw_rays[:, : raw_gt.shape[1], : raw_gt.shape[2]]
-            return raw_gt, raw_valid, raw_rays, "raw_lidar_tar"
-        except Exception as exc:
-            print(f"Raw LiDAR rays unavailable, using video/fallback rays: {exc}", flush=True)
+    if args.use_raw_rays:
+        if not sample_key:
+            raise ValueError("--sample-key or inference metadata is required for raw-online visualization")
+        raw_gt, raw_valid, raw_rays = load_mainline_raw_gt_and_rays(
+            args,
+            sample_key=str(sample_key),
+            n_frames=generated_range.shape[0],
+        )
+        return raw_gt, raw_valid, raw_rays, "raw_lidar_tar"
 
     gt_video = resolved["gt_video"]
-    if gt_video is not None:
-        gt_range = decode_video(Path(gt_video), args)
-        gt_source = "gt_video"
-    else:
-        gt_range = generated_range
-        gt_source = "generated_video"
+    if gt_video is None:
+        raise ValueError(
+            "--gt-video is required with --no-use-raw-rays; generated output cannot be used as its own GT."
+        )
+    gt_range = decode_video(Path(gt_video), args)
 
     layout_video = resolved["layout_video"]
     if layout_video is not None:
@@ -260,17 +252,26 @@ def resolve_gt_mask_and_rays(
         valid_mask = clip_shape(valid, args).astype(bool)
     else:
         valid_mask = valid_range_mask(gt_range, args.min_range, args.max_range, args.near_buffer, args.far_buffer)
-    rays = fallback_ray_directions(args, target_shape=generated_range.shape)
-    return gt_range, valid_mask, rays, gt_source
+    prepend_lidar_utils_repo(args.lidar_tokenizer_repo)
+    ray_args = SimpleNamespace(
+        downsample_factor_row=1, downsample_factor_col=1, downsample_method=args.downsample_method
+    )
+    rays = make_downsampled_ray_directions(np.zeros_like(generated_range), ray_args)
+    return gt_range, valid_mask, rays, "gt_video"
 
 
 def make_generated_valid_mask(
     generated_range: np.ndarray,
     gt_valid_mask: np.ndarray,
+    layout_valid_mask: np.ndarray | None,
     args: argparse.Namespace,
 ) -> tuple[np.ndarray, str]:
     if args.generated_valid_mode == "matched_gt":
         return gt_valid_mask.copy(), "matched_gt"
+    if args.generated_valid_mode == "layout":
+        if layout_valid_mask is None:
+            raise ValueError("--generated-valid-mode layout requires a layout video from --layout-video or metadata")
+        return layout_valid_mask.copy(), "layout_occupancy_threshold"
     valid = np.isfinite(generated_range) & (generated_range > (args.min_range + args.valid_min_offset_m))
     return valid.astype(bool, copy=False), "predicted_range_threshold"
 
@@ -328,14 +329,32 @@ def main() -> None:
         resolved,
         generated_range=generated_range,
     )
-    min_frames = min(generated_range.shape[0], gt_range.shape[0], valid_mask.shape[0])
+    layout_valid_mask = None
+    if args.generated_valid_mode == "layout":
+        layout_video = resolved["layout_video"]
+        if layout_video is None:
+            raise ValueError("--generated-valid-mode layout requires a layout video from --layout-video or metadata")
+        layout_valid, _edges = layout_masks(Path(layout_video), args)
+        layout_valid_mask = clip_shape(layout_valid, args).astype(bool)
+
+    min_frame_inputs = [generated_range.shape[0], gt_range.shape[0], valid_mask.shape[0]]
+    if layout_valid_mask is not None:
+        min_frame_inputs.append(layout_valid_mask.shape[0])
+    min_frames = min(min_frame_inputs)
     generated_range = generated_range[:min_frames]
     gt_range = gt_range[:min_frames]
     valid_mask = valid_mask[:min_frames]
+    if layout_valid_mask is not None:
+        layout_valid_mask = layout_valid_mask[:min_frames]
     if ray_directions.ndim == 4:
         ray_directions = ray_directions[:min_frames]
 
-    generated_valid_mask, generated_valid_source = make_generated_valid_mask(generated_range, valid_mask, args)
+    generated_valid_mask, generated_valid_source = make_generated_valid_mask(
+        generated_range,
+        valid_mask,
+        layout_valid_mask,
+        args,
+    )
     gt_for_vis = np.where(valid_mask, gt_range, 0.0)
     generated_for_vis = np.where(generated_valid_mask, generated_range, 0.0)
     name = str(resolved["name"])
@@ -364,7 +383,11 @@ def main() -> None:
             pred_valid_mask=generated_valid_mask,
         )
 
-    ply_paths = save_generated_ply(output_dir, name, generated_for_vis, generated_valid_mask, ray_directions, args) if args.save_ply else []
+    ply_paths = (
+        save_generated_ply(output_dir, name, generated_for_vis, generated_valid_mask, ray_directions, args)
+        if args.save_ply
+        else []
+    )
     summary = {
         "generated_video": str(resolved["generated_video"]),
         "gt_video": str(resolved["gt_video"]) if resolved["gt_video"] is not None else None,

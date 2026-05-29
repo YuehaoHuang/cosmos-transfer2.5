@@ -44,7 +44,7 @@ Options:
   --total-iter N              Final absolute training iteration. Default: 100000.
   --max-iter N                Alias for --total-iter.
   --chunk-iter N              Stop and relaunch every N iterations. Default: 10000.
-  --save-iter N               Checkpoint interval. Must divide chunk-iter. Default: 5000.
+  --save-iter N               Checkpoint interval. Must divide chunk-iter. Default: 1000.
   --sleep-seconds N           Sleep between chunks. Default: 30.
   --gpus N                    GPUs for torchrun. state_t=8 requires N in 1,2,4,8.
   --master-port PORT          torchrun master port.
@@ -58,15 +58,15 @@ Options:
   --no-load-training-state    Load model weights only from --load-path. Default.
   --learning-rate LR          Override optimizer.lr.
   --logging-iter N            Trainer logging interval. Default: 500.
-  --sample-iter N             Sampling callback interval. Default: 10000.
+  --sample-iter N             Sampling callback interval. Default: 5000.
   --num-conditional-frames N  One of 0, 1, 2. Default: 1.
   --sample-generation-types S Comma-separated t2v,i2v,v2v subset. Default: i2v.
   --scheduler-warmup-steps N  Scheduler warmup. Default: 1000.
   --scheduler-cycle-length N  Scheduler cycle length. Default: 100000.
-  --num-workers N             DataLoader workers per rank. Default: 1.
-  --decord-num-threads N      Decord decode threads per worker. Default: 1.
-  --pin-memory                Enable DataLoader pin_memory.
-  --no-pin-memory             Disable DataLoader pin_memory. Default.
+  --num-workers N             DataLoader workers per rank. Default: 4.
+  --decord-num-threads N      Decord decode threads per worker. Default: 4.
+  --pin-memory                Enable DataLoader pin_memory. Default.
+  --no-pin-memory             Disable DataLoader pin_memory.
   --wandb-mode MODE           WandB mode. Default: disabled.
   --tmux                      Launch this chunked run in a tmux session.
   --tmux-session NAME         tmux session name.

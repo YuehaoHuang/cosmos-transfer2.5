@@ -1,6 +1,6 @@
 # Waymo LiDAR Single-View Post-Training
 
-更新日期：2026-05-26
+更新日期：2026-05-30
 
 本文记录新的 Waymo TOP LiDAR rangemap 生成主线。训练代码走官方 single-view post-training 框架；dataloader 每个 batch 从 raw LiDAR tar 在线投影 target 和 `rangemap_layout`，训练步再在线调用 Wan2.1 VAE `encode` 得到 diffusion target。MP4 与 `.npz` 都不进入默认监督路径。
 
@@ -14,7 +14,7 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate drivesync
 ```
 
-当前已训练 checkpoint 使用的是 `/team/hyh/data/waymo_singleview_lidar_posttrain_from_tokenizer/training` 旧 tokenizer-converted 数据。2026-05-26 起，新的在线 encode 主线改为 raw Waymo TOP 投影的 `704x1280` contract；旧 `704x1200` 指标仅作为历史 sanity check。
+当前训练和后续推理评估主线均使用 raw Waymo TOP 投影的 `704x1280` contract。旧 tokenizer-converted `704x1200` checkpoint、指标和点云结果只作为历史记录，不可用于判断当前 online encode 方案。
 
 ## 目标
 
@@ -103,6 +103,9 @@ python scripts/prepare_waymo_lidar_singleview_posttrain_dataset.py \
   --output-root /tmp/waymo_lidar_layout_posttrain_smoke \
   --raw-waymo-root /team/hyh/data/rds_hq_waymo \
   --sample-list-source lidar \
+  --range-map-source raw \
+  --native-n-cols 1280 \
+  --repeat-row 11 \
   --max-samples 1 \
   --overwrite \
   --caption-mode fixed
@@ -143,11 +146,13 @@ transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune
 ```bash
 OUTPUT_ROOT=outputs/waymo_lidar_singleview_posttrain \
 NUM_GPUS=8 \
-TOTAL_ITER=40000 \
+TOTAL_ITER=100000 \
 CHUNK_ITER=10000 \
 SAVE_ITER=1000 \
 ./train_waymo_lidar_singleview_chunked.sh
 ```
+
+从已有 checkpoint 继续训练时，`TOTAL_ITER` 必须大于 `checkpoints/latest_checkpoint.txt` 中的 iteration；当前 raw-online 最新记录为 `iter_000053000`，因此不要再用 `TOTAL_ITER=40000` 之类低于最新 checkpoint 的值。
 
 `state_t=8` 要求 GPU 数整除 8，推荐 `1`、`2`、`4`、`8`。只有 7 张 GPU 可见时先用 `--gpus 4`。
 
@@ -170,10 +175,11 @@ USE_TMUX=false ./train_waymo_lidar_singleview_chunked.sh \
 DCP checkpoint 需要先转换成 `model_ema_bf16.pt`。建议把转换结果放到独立评估目录，避免污染训练 checkpoint：
 
 ```bash
-RUN=outputs/waymo_lidar_singleview_posttrain/cosmos_transfer2_posttrain/waymo_lidar_singleview/waymo_lidar_singleview_rangemap_layout_fullfinetune_i2v_t8
-ITER=iter_000075000
-EVAL_DIR=outputs/waymo_lidar_eval/waymo_lidar_singleview_rangemap_layout_fullfinetune_i2v_t8/$ITER
+RUN=outputs/waymo_lidar_singleview_posttrain/cosmos_transfer2_posttrain/waymo_lidar_singleview/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8
+ITER=iter_000053000
+EVAL_DIR=outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/$ITER
 
+mkdir -p "$EVAL_DIR/checkpoint_pt"
 python scripts/convert_distcp_to_pt.py \
   "$RUN/checkpoints/$ITER/model" \
   "$EVAL_DIR/checkpoint_pt"
@@ -182,7 +188,7 @@ python scripts/convert_distcp_to_pt.py \
 之后使用专用入口推理：
 
 ```bash
-DATASET_DIR=/team/hyh/data/waymo_singleview_lidar_posttrain_from_tokenizer/training
+SPLIT=training
 SAMPLE=10017090168044687777_6380_000_6400_000_0
 
 CUDA_VISIBLE_DEVICES=0 \
@@ -191,37 +197,44 @@ HF_HUB_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
 python scripts/infer_waymo_lidar_singleview_posttrain.py \
   --checkpoint-path "$EVAL_DIR/checkpoint_pt/model_ema_bf16.pt" \
-  --dataset-dir "$DATASET_DIR" \
   --sample-key "$SAMPLE" \
-  --output-dir "$EVAL_DIR/inference_train1_g3_s35_text" \
-  --name "${SAMPLE}_iter75000_ema_g3_s35_text" \
-  --experiment transfer2_singleview_posttrain_waymo_lidar_rangemap_layout_fullfinetune \
+  --raw-online-input \
+  --raw-lidar-root /team/hyh/data/rds_hq_waymo \
+  --raw-lidar-split "$SPLIT" \
+  --output-dir "$EVAL_DIR/inference_g3_s35_text_cond1" \
+  --name "${SAMPLE}_${ITER}_ema_g3_s35_text_cond1" \
+  --experiment transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune \
   --num-conditional-frames 1 \
   --num-steps 35 \
   --guidance 3 \
   --max-frames 29 \
-  --num-video-frames-per-chunk 29 \
-  --skip-comparison
+  --num-video-frames-per-chunk 29
 ```
 
-`--num-steps 35 --guidance 3` 对齐训练 callback 的常规采样设置；该命令使用正常 caption/text embedding。若只想隔离 layout control 能力，可额外加 `--zero-text-embedding`；去掉 `--skip-comparison` 会额外保存 GT/control/generated 拼接视频。
+`--num-steps 35 --guidance 3` 对齐训练 callback 的常规采样设置。online 实验会从 raw tar 重新投影 lossless `rangemap_target` 与 `rangemap_layout` 并直接注入模型；写出的 raw input MP4 只用于展示和 pipeline 尺寸载体，不作为模型 target/control。若只想隔离文本条件，可额外加 `--zero-text-embedding`。
+
+2026-05-28 注意：raw-online 推理必须确认日志中实际出现 `num_conditional_frames: 1 is set by data_batch[NUM_CONDITIONAL_FRAMES_KEY]`。此前 inference pipeline 对首个 chunk 固定写入 `0`，会导致命令传 `--num-conditional-frames 1` 但模型实际无首帧 latent 条件；已在 `model_video_inputs` 场景修正为按传入帧数换算 latent 条件帧。旧目录 `inference_g3_s35_text` 中同名结果按 cond=0 生成，不用于当前判断；当前有效结果使用 `inference_g3_s35_text_cond1`。
 
 输出：
 
 ```text
 <name>.mp4
 <name>_control_rangemap_layout.mp4
-<name>_comparison_gt_control_generated.mp4  # only when not using --skip-comparison
+<name>_raw_target_input.mp4                  # display only
+<name>_raw_layout_input.mp4                  # display only
+<name>_comparison_gt_control_generated.mp4
 ```
 
 ## 点云可视化
 
-Transfer2 推理保存的 `<name>.mp4` 已经是 decoder 后的 rangemap video，可以反归一化成米制 range，再按 Waymo TOP LiDAR ray/extrinsic 渲染点云。脚本会优先从同名 JSON 读取 `sample_key`、GT video 和 layout path，并尝试用原始 tokenizer tar 生成更准确的 valid mask 和 ray directions。
+Transfer2 推理保存的 `<name>.mp4` 是 decoder 后的 rangemap video。点云脚本读取同名 JSON 中的 `sample_key`，并严格复用 `docs/waymo_lidar_wan21_vae_preprocessing.md` 验证过的 raw TOP `64x1280` 投影、valid mask 和 ray/extrinsic 流程；raw GT 读取失败时直接报错，不会用 generated video 伪装成 GT。
 
 ```bash
 python scripts/visualize_waymo_lidar_generation.py \
-  --generated-video "$EVAL_DIR/inference_train1_g3_s35_text/${SAMPLE}_iter75000_ema_g3_s35_text.mp4" \
-  --output-dir "$EVAL_DIR/pointcloud_vis_train" \
+  --generated-video "$EVAL_DIR/inference_g3_s35_text_cond1/${SAMPLE}_${ITER}_ema_g3_s35_text_cond1.mp4" \
+  --split "$SPLIT" \
+  --raw-lidar-root /team/hyh/data/rds_hq_waymo \
+  --output-dir "$EVAL_DIR/pointcloud_vis_raw" \
   --pcd-renderer plotly \
   --raw-valid-mode preprocess \
   --generated-valid-mode predicted \
@@ -239,7 +252,7 @@ point_cloud/<name>.mp4
 
 `--pcd-renderer auto` 会优先走 Cosmos-Drive-Dreams 的 Plotly renderer；如果参考 renderer 因 `open3d` 缺失不可用，会使用本仓库的 Plotly fallback。当前环境已安装 `plotly==6.7.0` 和 `kaleido==0.2.1`，可直接导出 mp4；想导出逐帧点云文件时加 `--save-ply`。
 
-`--raw-valid-mode preprocess` 会按数据预处理口径构造 GT valid mask，避免把 0-5m 的近距离点误删。`--generated-valid-mode predicted` 会按 decoded generated range 自己的阈值构造 generated mask；如需旧式逐像素 range 对齐检查，可改成 `--generated-valid-mode matched_gt`。当前已生成 Plotly 示例：`outputs/waymo_lidar_eval/waymo_lidar_singleview_rangemap_layout_fullfinetune_i2v_t8/iter_000075000/pointcloud_vis_train1_g3_s35_text_predvalid/point_cloud/10017090168044687777_6380_000_6400_000_0_iter75000_ema_g3_s35_text.mp4`。
+`--raw-valid-mode preprocess` 与训练预处理相同，按 raw projected range `> 0` 构造 GT occupancy。`--generated-valid-mode predicted` 按 decoder 输出自己的 range 阈值构造 generated occupancy，用于诊断模型自身 occupancy；`--generated-valid-mode layout` 复用 layout control 的 occupancy 作为 generated point cloud mask，用于当前 layout-conditioned 路径的低噪声点云重建；`--generated-valid-mode matched_gt` 只用于 oracle 对照。
 
 ## 评估
 
@@ -247,9 +260,9 @@ point_cloud/<name>.mp4
 
 ```bash
 python scripts/evaluate_waymo_lidar_rangemap_generation.py \
-  --generated-video /path/to/generated.mp4 \
-  --gt-video "$DATASET_DIR/videos/$SAMPLE.mp4" \
-  --layout-video "$DATASET_DIR/rangemap_layout/$SAMPLE.mp4" \
+  --generated-video "$EVAL_DIR/inference_g3_s35_text_cond1/${SAMPLE}_${ITER}_ema_g3_s35_text_cond1.mp4" \
+  --gt-video "$EVAL_DIR/inference_g3_s35_text_cond1/${SAMPLE}_${ITER}_ema_g3_s35_text_cond1_raw_target_input.mp4" \
+  --layout-video "$EVAL_DIR/inference_g3_s35_text_cond1/${SAMPLE}_${ITER}_ema_g3_s35_text_cond1_raw_layout_input.mp4" \
   --layout-occupancy-threshold 90 \
   --layout-edge-threshold 90 \
   --output-json /tmp/<sample>_metrics.json
@@ -261,11 +274,216 @@ python scripts/evaluate_waymo_lidar_rangemap_generation.py \
 - occupancy precision / recall / F1 / IoU
 - edge precision / recall / F1 / IoU
 
-Layout mp4 经 H264 编码后会有低值残留，评估默认用阈值 90 提取 occupancy/edge mask，而不是 `>0`。
+数值评估入口读取展示 MP4，因此仍受 H264 量化影响；点云展示的 GT/rays 则直接来自 raw tar。Layout MP4 经 H264 编码后会有低值残留，评估默认用阈值 90 提取 occupancy/edge mask，而不是 `>0`。
 
-### 当前 sanity 指标
+### 当前 raw-online sanity 指标
 
-2026-05-26 使用 `iter_000075000`、EMA bf16、`num_steps=35`、`guidance=3`、正常 fixed caption/text embedding，在 1 个 training 样本 `10017090168044687777_6380_000_6400_000_0` 上得到：
+2026-05-28 使用当前 raw-online checkpoint `waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000053000`、EMA bf16、`num_steps=35`、`guidance=3`、正常 fixed caption/text embedding、实际 `num_conditional_frames=1`，在 1 个 training 样本 `10017090168044687777_6380_000_6400_000_0` 上得到：
+
+```text
+range_mae_m                 1.2966
+range_rmse_m                3.4973
+range_bias_m               -0.5907
+occupancy_iou               0.8371
+occupancy_f1                0.9113
+occupancy_precision/recall  0.9657 / 0.8627
+edge_iou                    0.4603
+edge_f1                     0.6304
+edge_precision/recall       0.5629 / 0.7162
+```
+
+结果文件：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000053000/metrics_g3_s35_text_cond1/10017090168044687777_6380_000_6400_000_0_iter_000053000_ema_g3_s35_text_cond1_metrics.json
+```
+
+704x1280 decode 后的 GT / GEN / abs error 对比：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000053000/rangemap_compare_704_g3_s35_text_cond1/10017090168044687777_6380_000_6400_000_0_iter_000053000_ema_g3_s35_text_cond1_gt_gen_absdiff_704x1280.mp4
+```
+
+该 704x1280 对比口径下的辅助指标为 `range_mae_m=1.2970`、`range_rmse_m=3.5040`、`range_bias_m=-0.5827`、`occupancy_iou=0.8348`、`occupancy_f1=0.9100`。
+
+点云 summary：
+
+```text
+GT valid                 2210832
+generated valid          1973789
+matched valid            1907370
+generated extra            66419
+generated missing         303462
+point cloud video: outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000053000/pointcloud_vis_raw_g3_s35_text_cond1/point_cloud/10017090168044687777_6380_000_6400_000_0_iter_000053000_ema_g3_s35_text_cond1.mp4
+```
+
+判断：不建议在 `iter_000053000` 直接停止训练。理由是 raw-online 主线相对旧 tokenizer-converted 结果已经大幅改善 range 误差和 edge 指标，但当前只有单个 training 样本 sanity，occupancy recall 仍只有 `0.8627`，点云仍有 `303462` 个 missing 点，说明模型偏保守、还没有充分覆盖 layout occupancy。训练日志在 `53100-53700` 附近 loss 仍在 `0.02-0.04` 区间波动，没有看到明显发散；继续训练风险不高。
+
+该建议已执行到 `iter_000100000`；后续是否继续训练以 100k 的 training sanity 和 validation8 结果为准。
+
+### iter_000100000 raw-online 指标
+
+2026-05-29 使用 `waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000`、EMA bf16、`num_steps=35`、`guidance=3`、fixed caption/text embedding、实际 `num_conditional_frames=1`，在同一 training 样本 `10017090168044687777_6380_000_6400_000_0` 上得到：
+
+```text
+range_mae_m                 1.2936
+range_rmse_m                3.4953
+range_bias_m               -0.5679
+occupancy_iou               0.8387
+occupancy_f1                0.9123
+occupancy_precision/recall  0.9657 / 0.8645
+edge_iou                    0.4612
+edge_f1                     0.6313
+edge_precision/recall       0.5640 / 0.7169
+```
+
+相对 `iter_000053000` 的同一样本，改善很小：`range_mae_m` 仅从 `1.2966` 到 `1.2936`，occupancy recall 从 `0.8627` 到 `0.8645`，点云 missing 从 `303462` 到 `299553`。
+
+结果文件：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/metrics_g3_s35_text_cond1/10017090168044687777_6380_000_6400_000_0_iter_000100000_ema_g3_s35_text_cond1_metrics.json
+```
+
+704x1280 decode 后的 GT / GEN / abs error 对比：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/rangemap_compare_704_g3_s35_text_cond1/10017090168044687777_6380_000_6400_000_0_iter_000100000_ema_g3_s35_text_cond1_gt_gen_absdiff_704x1280.mp4
+```
+
+该 704x1280 对比口径下的辅助指标为 `range_mae_m=1.2942`、`range_rmse_m=3.5025`、`range_bias_m=-0.5601`、`occupancy_iou=0.8363`、`occupancy_f1=0.9109`。
+
+点云 summary（`--generated-valid-mode predicted`，诊断模型自身 occupancy）：
+
+```text
+GT valid                 2210832
+generated valid          1977921
+matched valid            1911279
+generated extra            66642
+generated missing         299553
+point cloud video: outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_vis_raw_g3_s35_text_cond1/point_cloud/10017090168044687777_6380_000_6400_000_0_iter_000100000_ema_g3_s35_text_cond1.mp4
+```
+
+点云 summary（`--generated-valid-mode layout`，layout-conditioned 点云重建）：
+
+```text
+GT valid                 2210832
+generated valid          2209511
+matched valid            2209220
+generated extra              291
+generated missing           1612
+point cloud video: outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_vis_raw_g3_s35_text_cond1_layoutmask/point_cloud/10017090168044687777_6380_000_6400_000_0_iter_000100000_ema_g3_s35_text_cond1.mp4
+```
+
+同时抽了 3 个 validation segment 的首个 window 做 raw-online cond1 sanity。该集合很小，只用于发现明显问题，不能替代完整 validation：
+
+| sample | range MAE | range RMSE | bias | occ F1 / IoU | edge F1 / IoU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `10203656353524179475_7625_000_7645_000_0` | 4.3727 | 10.1390 | -2.6954 | 0.9311 / 0.8711 | 0.8066 / 0.6759 |
+| `1024360143612057520_3580_000_3600_000_0` | 1.0334 | 3.8011 | -0.5193 | 0.9608 / 0.9245 | 0.8099 / 0.6805 |
+| `10247954040621004675_2180_000_2200_000_0` | 1.1263 | 2.7844 | 0.1669 | 0.9558 / 0.9154 | 0.7424 / 0.5903 |
+| mean | 2.1774 | 5.5748 | -1.0160 | 0.9492 / 0.9037 | 0.7863 / 0.6489 |
+
+validation3 点云 totals（`predicted` generated occupancy）：
+
+```text
+GT valid                 5770664
+generated valid          5850156
+matched valid            5525212
+generated extra           324944
+generated missing         245452
+extra/missing rate        5.63% / 4.25%
+```
+
+validation3 点云 totals（`layout` generated occupancy）：
+
+```text
+GT valid                 5770664
+generated valid          5769098
+matched valid            5767788
+generated extra             1310
+generated missing           2876
+extra/missing rate        0.023% / 0.050%
+```
+
+validation3 结果文件：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation3_g3_s35_text_cond1_metrics/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_summary_validation3_g3_s35_text_cond1/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_summary_validation3_g3_s35_text_cond1_layoutmask/
+```
+
+2026-05-30 继续补跑 8 个 validation segment 的首个 window，仍使用 `iter_000100000` EMA bf16、`num_steps=35`、`guidance=3`、fixed caption/text embedding、实际 `num_conditional_frames=1`。推理需保留 `HF_HOME=/team/hyh/huggingface`，否则离线模式会找不到本地 Wan2.1 VAE tokenizer。
+
+| sample | range MAE | range RMSE | bias | occ F1 / IoU | edge F1 / IoU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `10203656353524179475_7625_000_7645_000_0` | 4.3758 | 10.1526 | -2.7149 | 0.9309 / 0.8707 | 0.8068 / 0.6762 |
+| `1024360143612057520_3580_000_3600_000_0` | 1.0331 | 3.7972 | -0.5169 | 0.9612 / 0.9254 | 0.8090 / 0.6793 |
+| `10247954040621004675_2180_000_2200_000_0` | 1.1286 | 2.7910 | 0.1807 | 0.9559 / 0.9154 | 0.7413 / 0.5890 |
+| `10289507859301986274_4200_000_4220_000_0` | 1.7013 | 4.4741 | 0.1734 | 0.9797 / 0.9602 | 0.7546 / 0.6060 |
+| `10335539493577748957_1372_870_1392_870_0` | 3.1734 | 7.2940 | -0.8891 | 0.9671 / 0.9362 | 0.7685 / 0.6240 |
+| `10359308928573410754_720_000_740_000_0` | 0.8994 | 2.9106 | -0.4352 | 0.9579 / 0.9191 | 0.7579 / 0.6102 |
+| `10448102132863604198_472_000_492_000_0` | 1.8919 | 5.3199 | -1.0678 | 0.8643 / 0.7611 | 0.7539 / 0.6051 |
+| `10689101165701914459_2072_300_2092_300_0` | 2.9008 | 7.4150 | -1.0274 | 0.9772 / 0.9555 | 0.7763 / 0.6344 |
+| mean | 2.1381 | 5.5193 | -0.7871 | 0.9493 / 0.9054 | 0.7711 / 0.6280 |
+
+validation8 mean 的完整 binary 均值：occupancy precision/recall/F1/IoU 为 `0.9392 / 0.9599 / 0.9493 / 0.9054`，edge precision/recall/F1/IoU 为 `0.6762 / 0.8985 / 0.7711 / 0.6280`。
+
+validation8 点云 totals（`predicted` generated occupancy）：
+
+```text
+GT valid                15949564
+generated valid         16276364
+matched valid           15342224
+generated extra           934140
+generated missing         607340
+extra/missing rate        5.86% / 3.81%
+```
+
+validation8 点云 totals（`layout` generated occupancy）：
+
+```text
+GT valid                15949564
+generated valid         15942951
+matched valid           15938770
+generated extra             4181
+generated missing          10794
+extra/missing rate        0.026% / 0.068%
+```
+
+704x1280 decode 后的 GT / GEN / abs error 诊断对比已补两个样本：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_rangemap_compare_704_g3_s35_text_cond1/10203656353524179475_7625_000_7645_000_0_iter_000100000_ema_g3_s35_text_cond1_gt_gen_absdiff_704x1280.mp4
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_rangemap_compare_704_g3_s35_text_cond1/10448102132863604198_472_000_492_000_0_iter_000100000_ema_g3_s35_text_cond1_gt_gen_absdiff_704x1280.mp4
+```
+
+704x1280 口径辅助指标：`102036...` 为 `range_mae_m=4.4080`、`range_rmse_m=10.1984`、`range_bias_m=-2.6707`；`104481...` 为 `range_mae_m=1.9079`、`range_rmse_m=5.3419`、`range_bias_m=-1.0263`。
+
+occupancy 最差样本 `10448102132863604198_472_000_492_000_0` 的点云视频：
+
+```text
+predicted mask: outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_vis_validation8_g3_s35_text_cond1/10448102132863604198_472_000_492_000_0/point_cloud/10448102132863604198_472_000_492_000_0_iter_000100000_ema_g3_s35_text_cond1.mp4
+layout mask:    outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_vis_validation8_g3_s35_text_cond1_layoutmask/10448102132863604198_472_000_492_000_0/point_cloud/10448102132863604198_472_000_492_000_0_iter_000100000_ema_g3_s35_text_cond1.mp4
+```
+
+validation8 结果文件：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_g3_s35_text_cond1/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_g3_s35_text_cond1_metrics/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_g3_s35_text_cond1_metrics/summary_iter_000100000_ema_g3_s35_text_cond1_validation8.json
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_summary_validation8_g3_s35_text_cond1/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_summary_validation8_g3_s35_text_cond1_layoutmask/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_rangemap_compare_704_g3_s35_text_cond1/
+```
+
+判断：不建议现在直接无条件继续长训。`iter_000100000` 在同一个 training sanity 上相对 53k 基本进入平台期；validation8 mean 与 validation3 接近，但样本间波动仍明显，`102036...` 的 `range_mae_m=4.3758`、`range_rmse_m=10.1526`，`104481...` 的 occupancy F1 只有 `0.8643`，predicted-mask 点云 extra/missing 达 `14.44% / 12.84%`。同时，复用 layout occupancy 后 validation8 点云 totals 的 extra/missing 从 `5.86% / 3.81%` 降到 `0.026% / 0.068%`，说明反投影几何和 raw rays 基本可用，当前主要瓶颈是 invalid/occupancy 表示与模型自身 occupancy，而不是单纯训练步数。建议先固定 validation8 或扩到 `20-50` 个 validation windows，对 53k/80k/100k 做同集合对比；如果 100k 没有稳定优于早期 checkpoint，下一轮应优先改 target/valid 表示、显式 occupancy/valid loss 或数据采样。若必须继续训练，只建议短续到 `120k`，每 `5k-10k` 用固定 validation 集 early stop。
+
+### 历史 tokenizer-converted sanity 指标
+
+以下数值来自旧 `rangemap_layout_fullfinetune_i2v_t8` / tokenizer-converted checkpoint，不代表 raw-online 主线。2026-05-26 使用 `iter_000075000`、EMA bf16、`num_steps=35`、`guidance=3`、正常 fixed caption/text embedding，在 1 个 training 样本 `10017090168044687777_6380_000_6400_000_0` 上得到：
 
 ```text
 range_mae_m                 14.7988

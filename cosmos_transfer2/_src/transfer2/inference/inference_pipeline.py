@@ -205,6 +205,7 @@ class ControlVideo2WorldInference:
         negative_prompt: str = None,
         control_weight: str = "1.0",
         image_context: torch.Tensor = None,
+        model_video_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepares the input data batch for the diffusion model.
@@ -237,6 +238,13 @@ class ControlVideo2WorldInference:
             "control_weight": [float(w) for w in control_weight.split(",")],
             "input_video": video,
         }
+        if model_video_inputs is not None:
+            for key, value in model_video_inputs.items():
+                if value.shape != prev_output.shape:
+                    raise ValueError(
+                        f"Model video input {key} has shape {tuple(value.shape)}, expected {tuple(prev_output.shape)}."
+                    )
+                data_batch[key] = value
 
         # Move tensors to GPU and convert to bfloat16 if they are floating point
         for k, v in data_batch.items():
@@ -320,6 +328,8 @@ class ControlVideo2WorldInference:
         preset_blur_strength: str = "medium",
         seg_control_prompt: str | None = None,
         input_control_video_paths: dict[str, str] | None = None,
+        input_control_tensors: dict[str, torch.Tensor] | None = None,
+        model_video_inputs: dict[str, torch.Tensor] | None = None,
         show_control_condition: bool = False,
         show_input: bool = False,
         image_context_path: Optional[str] = None,
@@ -343,6 +353,8 @@ class ControlVideo2WorldInference:
             negative_prompt (str, optional): Negative prompt for classifier-free guidance. Defaults to None.
             max_frames (int, optional): Maximum number of frames to read from the video. Defaults to None. 1 for image.
             context_frame_idx (int, optional): Frame index of the input video to use as image context. Defaults to None. In this case, can still use image_context_path to provide image context.
+            input_control_tensors: Optional lossless CTHW control tensors keyed by hint name.
+            model_video_inputs: Optional lossless CTHW model inputs, such as an online VAE target.
         Returns:
             torch.Tensor: The generated video tensor (B, C, T, H, W) in the range [-1, 1].
             dict[str, torch.Tensor]: Dictionary mapping hint key to the corresponding control input video tensor.
@@ -402,11 +414,26 @@ class ControlVideo2WorldInference:
             log.info("Loading control inputs...")
             control_input_dict, mask_video_dict = read_and_process_control_input(
                 video_path=video_path,
-                input_control_paths=input_control_video_paths,
+                input_control_paths=input_control_video_paths or {},
                 hint_key=hint_key,
                 resolution=resolution,
                 seg_control_prompt=seg_control_prompt,
             )
+            if input_control_tensors is not None:
+                for key, tensor in input_control_tensors.items():
+                    control_key = key if key.startswith("control_input_") else f"control_input_{key}"
+                    if tensor.dim() != 4 or tensor.shape != input_frames.shape:
+                        raise ValueError(
+                            f"Control tensor {control_key} has shape {tuple(tensor.shape)}, "
+                            f"expected CTHW {tuple(input_frames.shape)}."
+                        )
+                    control_input_dict[control_key] = tensor
+            if model_video_inputs is not None:
+                for key, tensor in model_video_inputs.items():
+                    if tensor.dim() != 4 or tensor.shape != input_frames.shape:
+                        raise ValueError(
+                            f"Model video input {key} has shape {tuple(tensor.shape)}, expected CTHW {tuple(input_frames.shape)}."
+                        )
 
             # -------- Stuff to handle chunk-wise long video generation --------
             num_total_frames, num_chunks, num_frames_per_chunk = self._get_num_chunks(
@@ -451,6 +478,14 @@ class ControlVideo2WorldInference:
                 else:
                     text_embedding = text_embeddings
 
+                cur_model_video_inputs = None
+                if model_video_inputs is not None:
+                    cur_model_video_inputs = {}
+                    for key, tensor in model_video_inputs.items():
+                        cur_tensor = tensor[:, chunk_start_frame:chunk_end_frame]
+                        cur_tensor = self._pad_input_frames(cur_tensor, cur_tensor.shape[1], num_video_frames_per_chunk)
+                        cur_model_video_inputs[key] = cur_tensor[None]
+
                 # Prepare the data batch with current input. Note: this doesn't include control inputs yet.
                 data_batch = self._get_data_batch_input(
                     cur_input_frames,
@@ -460,6 +495,7 @@ class ControlVideo2WorldInference:
                     negative_prompt=negative_prompt,
                     control_weight=control_weight,
                     image_context=image_context,
+                    model_video_inputs=cur_model_video_inputs,
                 )
 
                 # Process control inputs as specified in the hint_key list.
@@ -480,12 +516,13 @@ class ControlVideo2WorldInference:
                     preset_blur_strength=preset_blur_strength,
                 )
 
-                if chunk_id == 0:
+                latent_conditional_frames = (
+                    0 if num_conditional_frames <= 0 else 1 + (num_conditional_frames - 1) // 4
+                )  # tokenizer temporal compression is 4x
+                if chunk_id == 0 and model_video_inputs is None:
                     data_batch[NUM_CONDITIONAL_FRAMES_KEY] = 0
                 else:
-                    data_batch[NUM_CONDITIONAL_FRAMES_KEY] = (
-                        1 + (num_conditional_frames - 1) // 4
-                    )  # tokenizer temporal compression is 4x
+                    data_batch[NUM_CONDITIONAL_FRAMES_KEY] = latent_conditional_frames
 
                 random.seed(seed)
                 seed = random.randint(0, 1000000)
