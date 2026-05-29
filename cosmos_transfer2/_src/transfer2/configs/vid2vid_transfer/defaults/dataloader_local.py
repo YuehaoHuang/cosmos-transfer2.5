@@ -185,6 +185,8 @@ def register_dataloader_local() -> None:
         layout_edge_threshold_m=1.0,
         fallback_caption="A monochrome LiDAR range-map video.",
         rangemap_target_key="rangemap_target",
+        rangemap_valid_mask_key="rangemap_valid_mask",
+        rangemap_edge_mask_key="rangemap_edge_mask",
         rangemap_target_repeat_row=11,
         rangemap_target_repeat_col=1,
         expected_rangemap_target_shape=(3, 29, 704, 1280),

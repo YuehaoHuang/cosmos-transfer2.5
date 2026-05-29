@@ -19,6 +19,7 @@ from typing import Callable, Dict, Tuple
 import attrs
 import torch
 import torch.distributed.checkpoint as dcp
+import torch.nn.functional as F
 import torch.nn as nn
 from einops import rearrange
 from megatron.core import parallel_state
@@ -58,6 +59,11 @@ class ControlVideo2WorldRectifiedFlowConfig(Video2WorldModelRectifiedFlowConfig)
     use_reference_image: bool = False  # Whether to use reference image as control input
     online_target_key: str | None = None  # Optional normalized target to encode online instead of reading target MP4.
     expected_online_target_shape: tuple[int, int, int, int] | None = None
+    online_target_valid_mask_key: str | None = None
+    online_target_edge_mask_key: str | None = None
+    online_target_valid_loss_weight: float = 1.0
+    online_target_edge_loss_weight: float = 1.0
+    online_target_invalid_loss_weight: float = 1.0
 
 
 class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
@@ -71,6 +77,58 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         self.hint_keys = parse_control_hint_keys(config.hint_keys)
         super().__init__(config, *args, **kwargs)
         log.info(self.net, rank0_only=True)
+
+    def _downsample_online_target_mask(
+        self,
+        data_batch: dict[str, torch.Tensor],
+        key: str,
+        target_state: torch.Tensor,
+        latent_state: torch.Tensor,
+    ) -> torch.Tensor:
+        if key not in data_batch:
+            raise KeyError(f"Missing online target mask key: {key}")
+        mask = data_batch[key]
+        if mask.dim() != 5:
+            raise ValueError(f"Expected online target mask shape [B, 1, T, H, W], got {tuple(mask.shape)}")
+        if mask.shape[0] != target_state.shape[0] or tuple(mask.shape[2:]) != tuple(target_state.shape[2:]):
+            raise ValueError(
+                f"Online target mask {key} shape {tuple(mask.shape)} does not align with target "
+                f"{tuple(target_state.shape)}"
+            )
+        if mask.shape[1] != 1:
+            raise ValueError(f"Online target mask {key} must have one channel, got {mask.shape[1]}")
+        return F.interpolate(
+            mask.to(device=target_state.device, dtype=torch.float32),
+            size=latent_state.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        ).clamp_(0.0, 1.0)
+
+    def _maybe_add_online_target_loss_weight(
+        self,
+        data_batch: dict[str, torch.Tensor],
+        target_state: torch.Tensor,
+        latent_state: torch.Tensor,
+    ) -> None:
+        if self.config.edm_loss_weight_key is None or not torch.is_grad_enabled():
+            return
+        if self.config.online_target_valid_mask_key is None:
+            raise ValueError("online_target_valid_mask_key must be set when edm_loss_weight_key is enabled")
+
+        base_weight = self.config.online_target_invalid_loss_weight
+        valid_ratio = self._downsample_online_target_mask(
+            data_batch, self.config.online_target_valid_mask_key, target_state, latent_state
+        )
+        weight = base_weight + valid_ratio * (self.config.online_target_valid_loss_weight - base_weight)
+
+        if self.config.online_target_edge_mask_key is not None:
+            edge_ratio = self._downsample_online_target_mask(
+                data_batch, self.config.online_target_edge_mask_key, target_state, latent_state
+            )
+            edge_weight = base_weight + edge_ratio * (self.config.online_target_edge_loss_weight - base_weight)
+            weight = torch.maximum(weight, edge_weight)
+
+        data_batch[self.config.edm_loss_weight_key] = weight.contiguous()
 
     def get_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
@@ -112,6 +170,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                     f"Online encoded target grid {tuple(latent_state.shape[2:])} does not match "
                     f"state_t and target spatial grid {expected_grid}"
                 )
+            self._maybe_add_online_target_loss_weight(data_batch, target_state, latent_state)
             raw_state = target_state
             condition = self.conditioner(data_batch).edit_data_type(DataType.VIDEO)
             condition = condition.set_video_condition(

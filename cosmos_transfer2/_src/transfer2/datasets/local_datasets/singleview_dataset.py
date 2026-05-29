@@ -125,6 +125,8 @@ class SingleViewTransferDataset(Dataset):
         caption_type: Type of caption to load (default: "t2w_qwen2p5_7b")
         rangemap_target_folder: Optional folder containing preprocessed lossless range-map targets.
         rangemap_target_key: Data-batch key used for online target encoding.
+        rangemap_valid_mask_key: Data-batch key used for optional online target loss weighting.
+        rangemap_edge_mask_key: Data-batch key used for optional edge-aware target loss weighting.
         rangemap_target_repeat_row: Vertical expansion applied to the stored target.
         expected_rangemap_target_shape: Optional required target video tensor shape (C, T, H, W).
         raw_rangemap_online: Build Waymo range-map target and rangemap_layout from raw LiDAR tar files at load time.
@@ -144,6 +146,8 @@ class SingleViewTransferDataset(Dataset):
         decord_num_threads: int | None = None,
         rangemap_target_folder: str | None = None,
         rangemap_target_key: str = "rangemap_target",
+        rangemap_valid_mask_key: str = "rangemap_valid_mask",
+        rangemap_edge_mask_key: str = "rangemap_edge_mask",
         rangemap_target_repeat_row: int = 11,
         rangemap_target_repeat_col: int = 1,
         expected_rangemap_target_shape: tuple[int, int, int, int] | None = None,
@@ -181,6 +185,8 @@ class SingleViewTransferDataset(Dataset):
             raise ValueError(f"decord_num_threads must be positive, got: {decord_num_threads}")
         self.decord_num_threads = decord_num_threads
         self.rangemap_target_key = rangemap_target_key
+        self.rangemap_valid_mask_key = rangemap_valid_mask_key
+        self.rangemap_edge_mask_key = rangemap_edge_mask_key
         self.rangemap_target_repeat_row = rangemap_target_repeat_row
         self.rangemap_target_repeat_col = rangemap_target_repeat_col
         self.expected_rangemap_target_shape = (
@@ -378,7 +384,7 @@ class SingleViewTransferDataset(Dataset):
 
     def _load_online_raw_rangemap_sample(
         self, video_name: str
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, list[int]]:
         """Project a raw Waymo LiDAR window into target and control tensors."""
 
         from scripts.prepare_waymo_lidar_singleview_posttrain_dataset import (
@@ -445,8 +451,17 @@ class SingleViewTransferDataset(Dataset):
                 f"Online raw LiDAR target/control alignment mismatch for {video_name}: "
                 f"target={tuple(target.shape)}, video={tuple(video.shape)}, layout={tuple(layout.shape)}"
             )
+        valid_expanded = valid_mask[:, None, :, :]
+        valid_expanded = np.repeat(valid_expanded, self.rangemap_target_repeat_row, axis=2)
+        valid_expanded = np.repeat(valid_expanded, self.rangemap_target_repeat_col, axis=3)
+        valid_t = torch.from_numpy(valid_expanded).permute(1, 0, 2, 3).contiguous().bool()
+        edge_t = torch.from_numpy(layout_frames[..., 1] > 0).permute(0, 1, 2).unsqueeze(0).contiguous().bool()
+        if valid_t.shape[1:] != target.shape[1:]:
+            raise ValueError(f"Online raw LiDAR valid mask shape mismatch for {video_name}: {valid_t.shape}")
+        if edge_t.shape[1:] != target.shape[1:]:
+            raise ValueError(f"Online raw LiDAR edge mask shape mismatch for {video_name}: {edge_t.shape}")
         frame_ids = list(range(frame_start, frame_start + self.sequence_length))
-        return video, layout, target, float(self.online_fps), frame_ids
+        return video, layout, target, valid_t, edge_t, float(self.online_fps), frame_ids
 
     def _validate_videos(self) -> None:
         """Validate all videos and pre-mark bad ones (too short, corrupted, etc.).
@@ -684,10 +699,18 @@ class SingleViewTransferDataset(Dataset):
 
                 online_rangemap_target = None
                 online_rangemap_layout = None
+                online_rangemap_valid_mask = None
+                online_rangemap_edge_mask = None
                 if self.raw_rangemap_online:
-                    video, online_rangemap_layout, online_rangemap_target, fps, frame_ids = (
-                        self._load_online_raw_rangemap_sample(video_name)
-                    )
+                    (
+                        video,
+                        online_rangemap_layout,
+                        online_rangemap_target,
+                        online_rangemap_valid_mask,
+                        online_rangemap_edge_mask,
+                        fps,
+                        frame_ids,
+                    ) = self._load_online_raw_rangemap_sample(video_name)
                 else:
                     frames, fps, frame_ids = self._load_video(video_path)
                     frames = frames.astype(np.uint8)
@@ -805,6 +828,20 @@ class SingleViewTransferDataset(Dataset):
                             f"Range-map target {rangemap_target.shape} does not align with control/video {data['video'].shape}"
                         )
                     data[self.rangemap_target_key] = rangemap_target
+                if online_rangemap_valid_mask is not None:
+                    if online_rangemap_valid_mask.shape[1:] != data["video"].shape[1:]:
+                        raise ValueError(
+                            f"Range-map valid mask {online_rangemap_valid_mask.shape} does not align with "
+                            f"video {data['video'].shape}"
+                        )
+                    data[self.rangemap_valid_mask_key] = online_rangemap_valid_mask
+                if online_rangemap_edge_mask is not None:
+                    if online_rangemap_edge_mask.shape[1:] != data["video"].shape[1:]:
+                        raise ValueError(
+                            f"Range-map edge mask {online_rangemap_edge_mask.shape} does not align with "
+                            f"video {data['video'].shape}"
+                        )
+                    data[self.rangemap_edge_mask_key] = online_rangemap_edge_mask
 
                 log.debug(
                     f"Dataset sample ready: video={data['video'].shape} {data['video'].dtype}, "

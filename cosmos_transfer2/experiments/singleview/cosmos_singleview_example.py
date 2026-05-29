@@ -198,7 +198,13 @@ transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune["job
     name="transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune"
 )
 transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune["model"]["config"].update(
+    edm_loss_weight_key="edm_loss_weight",
     online_target_key="rangemap_target",
+    online_target_valid_mask_key="rangemap_valid_mask",
+    online_target_edge_mask_key="rangemap_edge_mask",
+    online_target_valid_loss_weight=1.25,
+    online_target_edge_loss_weight=2.0,
+    online_target_invalid_loss_weight=1.0,
     expected_online_target_shape=(3, 29, 704, 1280),
 )
 

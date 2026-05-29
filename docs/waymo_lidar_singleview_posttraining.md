@@ -481,6 +481,48 @@ outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8
 
 判断：不建议现在直接无条件继续长训。`iter_000100000` 在同一个 training sanity 上相对 53k 基本进入平台期；validation8 mean 与 validation3 接近，但样本间波动仍明显，`102036...` 的 `range_mae_m=4.3758`、`range_rmse_m=10.1526`，`104481...` 的 occupancy F1 只有 `0.8643`，predicted-mask 点云 extra/missing 达 `14.44% / 12.84%`。同时，复用 layout occupancy 后 validation8 点云 totals 的 extra/missing 从 `5.86% / 3.81%` 降到 `0.026% / 0.068%`，说明反投影几何和 raw rays 基本可用，当前主要瓶颈是 invalid/occupancy 表示与模型自身 occupancy，而不是单纯训练步数。建议先固定 validation8 或扩到 `20-50` 个 validation windows，对 53k/80k/100k 做同集合对比；如果 100k 没有稳定优于早期 checkpoint，下一轮应优先改 target/valid 表示、显式 occupancy/valid loss 或数据采样。若必须继续训练，只建议短续到 `120k`，每 `5k-10k` 用固定 validation 集 early stop。
 
+
+### 下一轮训练改动：valid + edge aware latent loss
+
+2026-05-30 开始修改训练代码，本轮不只针对 occupancy/invalid，而是把 raw rangemap 的有效测距区域和 range discontinuity/edge 区域都纳入训练权重；不改变 raw target/control 的外部数据格式：
+
+- `SingleViewTransferDataset` 在 raw-online 路径额外输出 `rangemap_valid_mask` 和 `rangemap_edge_mask`。`valid` 来自 raw projected range `> 0`，`edge` 复用 `rangemap_layout` 的 occupancy boundary 与 range discontinuity 定义；二者 shape 均为 `[1, 29, 704, 1280]`。
+- `ControlVideo2WorldModelRectifiedFlow` 在在线 encode `rangemap_target` 后，将 valid/edge mask trilinear 下采样到 latent grid `[B, 1, 8, 88, 160]`，合成 `edm_loss_weight`。
+- `Text2WorldModelRectifiedFlow` 支持可选 `edm_loss_weight_key`，对 rectified-flow latent MSE 做 per-latent 加权，并按 mean weight 归一化，避免整体 loss scale 大幅漂移；context-parallel split 会同步处理 loss weight。
+- 当前 LiDAR raw-online 主实验启用 `invalid=1.0`、`valid=1.25`、`edge=2.0`。最终 per-latent weight 取 valid-derived weight 与 edge-derived weight 的逐点最大值，目标是同时补强有效 range、边界/不连续结构和点云几何，而不是只优化 occupancy。
+
+对应配置已写入：
+
+```text
+transfer2_singleview_posttrain_waymo_lidar_wan21_online_layout_fullfinetune["model"]["config"]:
+  edm_loss_weight_key="edm_loss_weight"
+  online_target_valid_mask_key="rangemap_valid_mask"
+  online_target_edge_mask_key="rangemap_edge_mask"
+  online_target_valid_loss_weight=1.25
+  online_target_edge_loss_weight=2.0
+  online_target_invalid_loss_weight=1.0
+```
+
+最小验证：
+
+```text
+python -m py_compile cosmos_transfer2/_src/predict2/models/text2world_model_rectified_flow.py \
+  cosmos_transfer2/_src/transfer2/models/vid2vid_model_control_vace_rectified_flow.py \
+  cosmos_transfer2/_src/transfer2/datasets/local_datasets/singleview_dataset.py \
+  cosmos_transfer2/_src/transfer2/configs/vid2vid_transfer/defaults/dataloader_local.py \
+  cosmos_transfer2/experiments/singleview/cosmos_singleview_example.py
+
+raw sample smoke:
+video/layout/target = (3, 29, 704, 1280)
+valid mask          = (1, 29, 704, 1280), dtype=torch.bool, count=22405922
+edge mask           = (1, 29, 704, 1280), dtype=torch.bool, count=8994337
+
+latent weight smoke:
+shape=(2, 1, 8, 88, 160), min=1.0, max=2.0, mean=1.0683
+```
+
+下一次训练建议从 `iter_000100000` 短续到 `120k`，并继续沿用固定 validation8（8 条数据、每卡一条）做对比；不要再更换验证集合，否则 53k/100k/valid-edge-weighted 结果不可直接比较。
+
 ### 历史 tokenizer-converted sanity 指标
 
 以下数值来自旧 `rangemap_layout_fullfinetune_i2v_t8` / tokenizer-converted checkpoint，不代表 raw-online 主线。2026-05-26 使用 `iter_000075000`、EMA bf16、`num_steps=35`、`guidance=3`、正常 fixed caption/text embedding，在 1 个 training 样本 `10017090168044687777_6380_000_6400_000_0` 上得到：

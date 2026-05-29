@@ -100,6 +100,7 @@ class Text2WorldModelRectifiedFlowConfig:
     use_dynamic_shift: bool = False
     train_time_distribution: str = "logitnormal"
     train_time_weight: str = "uniform"
+    edm_loss_weight_key: str | None = None  # Optional per-latent EDM loss weights, shape [B, 1|C, T, H, W].
 
     use_high_sigma_strategy: bool = False  # Whether to use high sigma strategy
     high_sigma_ratio: float = 0.05  # Ratio of high sigma frames
@@ -428,6 +429,33 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         return x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T
 
+    def broadcast_split_optional_video_tensor(
+        self,
+        tensor_B_C_T_H_W: Tensor | None,
+        reference_shape: torch.Size,
+        is_video: bool,
+    ) -> Tensor | None:
+        if tensor_B_C_T_H_W is None:
+            return None
+        cp_group = self.get_context_parallel_group()
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if is_video and cp_size > 1:
+            use_spatial_split = cp_size > reference_shape[2] or reference_shape[2] % cp_size != 0
+            after_split_shape = find_split(reference_shape, cp_size) if use_spatial_split else None
+            if use_spatial_split:
+                tensor_B_C_T_H_W = rearrange(tensor_B_C_T_H_W, "B C T H W -> B C (T H W)")
+            tensor_B_C_T_H_W = broadcast_split_tensor(
+                tensor_B_C_T_H_W, seq_dim=2, process_group=cp_group
+            )
+            if use_spatial_split:
+                tensor_B_C_T_H_W = rearrange(
+                    tensor_B_C_T_H_W,
+                    "B C (T H W) -> B C T H W",
+                    T=after_split_shape[0],
+                    H=after_split_shape[1],
+                )
+        return tensor_B_C_T_H_W
+
     def _update_train_stats(self, data_batch: dict[str, torch.Tensor]) -> None:
         is_image = self.is_image_batch(data_batch)
         input_key = self.input_image_key if is_image else self.input_data_key
@@ -740,14 +768,47 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
         _, x0_B_C_T_H_W, condition = self.get_data_and_condition(data_batch)
 
+        edm_loss_weight_B_C_T_H_W = None
+        if self.config.edm_loss_weight_key is not None and torch.is_grad_enabled():
+            if self.config.edm_loss_weight_key not in data_batch:
+                raise KeyError(f"Missing EDM loss weight key: {self.config.edm_loss_weight_key}")
+            edm_loss_weight_B_C_T_H_W = data_batch[self.config.edm_loss_weight_key]
+            if edm_loss_weight_B_C_T_H_W.dim() != 5:
+                raise ValueError(
+                    f"Expected EDM loss weight shape [B, 1|C, T, H, W], got "
+                    f"{tuple(edm_loss_weight_B_C_T_H_W.shape)}"
+                )
+            if edm_loss_weight_B_C_T_H_W.shape[0] != x0_B_C_T_H_W.shape[0]:
+                raise ValueError("EDM loss weight batch size does not match latent batch size")
+            if edm_loss_weight_B_C_T_H_W.shape[1] not in (1, x0_B_C_T_H_W.shape[1]):
+                raise ValueError(
+                    f"EDM loss weight channel count must be 1 or {x0_B_C_T_H_W.shape[1]}, "
+                    f"got {edm_loss_weight_B_C_T_H_W.shape[1]}"
+                )
+            if tuple(edm_loss_weight_B_C_T_H_W.shape[2:]) != tuple(x0_B_C_T_H_W.shape[2:]):
+                raise ValueError(
+                    f"EDM loss weight grid {tuple(edm_loss_weight_B_C_T_H_W.shape[2:])} does not match "
+                    f"latent grid {tuple(x0_B_C_T_H_W.shape[2:])}"
+                )
+            edm_loss_weight_B_C_T_H_W = edm_loss_weight_B_C_T_H_W.to(
+                device=x0_B_C_T_H_W.device, dtype=torch.float32
+            )
+
         # Sample pertubation noise levels and N(0, 1) noises
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), **self.tensor_kwargs_fp32)
         batch_size = x0_B_C_T_H_W.size()[0]
         t_B = self.rectified_flow.sample_train_time(batch_size).to(**self.tensor_kwargs_fp32)
         t_B = rearrange(t_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
 
+        x0_shape_before_split = x0_B_C_T_H_W.shape
+        is_video_condition = condition.is_video
         x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, t_B = self.broadcast_split_for_model_parallelsim(
             x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, t_B
+        )
+        edm_loss_weight_B_C_T_H_W = self.broadcast_split_optional_video_tensor(
+            edm_loss_weight_B_C_T_H_W,
+            x0_shape_before_split,
+            is_video_condition,
         )
         timesteps = self.rectified_flow.get_discrete_timestamp(t_B, self.tensor_kwargs_fp32)
 
@@ -786,9 +847,21 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         )
 
         time_weights_B = self.rectified_flow.train_time_weight(timesteps, self.tensor_kwargs_fp32)
-        per_instance_loss = torch.mean(
-            (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2, dim=list(range(1, vt_pred_B_C_T_H_W.dim()))
-        )
+        pred_mse_B_C_T_H_W = (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2
+        if edm_loss_weight_B_C_T_H_W is None:
+            per_instance_loss = torch.mean(pred_mse_B_C_T_H_W, dim=list(range(1, pred_mse_B_C_T_H_W.dim())))
+        else:
+            if edm_loss_weight_B_C_T_H_W.shape[1] == 1 and pred_mse_B_C_T_H_W.shape[1] != 1:
+                edm_loss_weight_B_C_T_H_W = edm_loss_weight_B_C_T_H_W.expand(
+                    -1, pred_mse_B_C_T_H_W.shape[1], -1, -1, -1
+                )
+            edm_loss_weight_B_C_T_H_W = edm_loss_weight_B_C_T_H_W.to(
+                device=pred_mse_B_C_T_H_W.device, dtype=pred_mse_B_C_T_H_W.dtype
+            )
+            weight_dims = list(range(1, pred_mse_B_C_T_H_W.dim()))
+            weighted_loss = torch.mean(pred_mse_B_C_T_H_W * edm_loss_weight_B_C_T_H_W, dim=weight_dims)
+            weight_mean = torch.mean(edm_loss_weight_B_C_T_H_W, dim=weight_dims).clamp_min(1e-6)
+            per_instance_loss = weighted_loss / weight_mean
 
         loss = torch.mean(time_weights_B * per_instance_loss)
         output_batch = {
@@ -803,6 +876,8 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             "per_instance_loss": per_instance_loss,
             "n_cond_frames": condition.num_conditional_frames_B,
         }
+        if edm_loss_weight_B_C_T_H_W is not None:
+            output_batch["edm_loss_weight_mean"] = edm_loss_weight_B_C_T_H_W.detach().float().mean()
 
         return output_batch, loss
 
