@@ -701,6 +701,312 @@ CUDA_VISIBLE_DEVICES=0 python scripts/smoke_waymo_lidar_wan21_vae.py \
 - `512` 是严格 `3:4` 输入比例，即 `384x512`，latent spatial 是 `48 x 64 = 3072`，MAE/RMSE 为 `1.3272m/4.2601m`；低于 `640` 后指标开始持续变差。
 - 这些指标是在不同投影列数各自的 evaluation grid 上计算的；因为有效像素数量不同，它们适合作为工程选型参考，不是严格逐像素同网格比较。
 
+### 2026-05-30 official Waymo range image sanity
+
+为确认 raw 数据和当前 `rds_hq` 中间格式之间的关系，新增脚本直接使用官方 Waymo Open Dataset TensorFlow API 从原始 TFRecord 加载 range image，并用 `frame_utils.convert_range_image_to_point_cloud` 还原点云：
+
+```text
+scripts/inspect_waymo_official_lidar.py
+```
+
+运行环境和输入：
+
+```text
+raw TFRecord root: /team/hyh/data/waymo/raw
+official code/env: /team/hyh/code/waymo-open-dataset, conda env waymo-kitti
+rds_hq raw root: /team/hyh/data/rds_hq_waymo
+```
+
+关键命令示例：
+
+```text
+source /opt/conda/etc/profile.d/conda.sh
+conda activate waymo-kitti
+python scripts/inspect_waymo_official_lidar.py \
+  --split validation \
+  --segment-key 10448102132863604198_472_000_492_000 \
+  --num-frames 29 \
+  --frame-step 1 \
+  --rds-frame-suffix-step 3 \
+  --compare-rds-raw \
+  --no-save-ply \
+  --output-dir outputs/waymo_official_lidar/validation/10448102132863604198_472_000_492_000_validation29_frameindex
+```
+
+注意帧号映射：Waymo TFRecord 的连续 frame index `i` 对应当前 `rds_hq` tar 里的后缀 `i * 3`，例如 TFRecord frame `1` 对应 `*.000003.lidar_raw.npz`。脚本显式记录 `tfrecord_frame_index` 和 `rds_frame_suffix`，避免把两者误当成同一个编号。
+
+官方 range image shape：
+
+- TOP LiDAR return range image 是 `[64, 2650, 4]`。
+- FRONT/SIDE/REAR 等非 TOP LiDAR range image 是 `[200, 600, 4]`。
+- 当前生成训练主线只使用 TOP LiDAR。
+
+`10448102132863604198_472_000_492_000` 前 29 帧官方 TOP 统计：
+
+```text
+official TOP return1 valid        3447326
+official TOP return2 valid         162177
+official TOP return1+return2      3609503
+rds_hq lidar_raw xyz              3609503
+```
+
+RDS raw xyz 到官方 TOP return1+return2 点云的 nearest-neighbor 误差在这 29 帧上为微米级：mean `1.13e-6m`，p50 mean `7.23e-7m`，p99 mean `6.99e-6m`，最大 `6.13e-5m`，全部点都在 `1mm` 内。结论是：当前 `rds_hq_waymo/*/lidar_raw/*.tar` 保存的是官方 TOP LiDAR 的 return1+return2 点云，不是五个 LiDAR 的全集，也不是 TOP return1-only；点坐标本身没有明显损失。
+
+固定 validation8 的每条第 0 帧也做了同样对齐：8/8 个样本的 RDS 点数都等于官方 TOP return1+return2，平均每帧 return1 `142075` 点、return2 `13163` 点、return1+return2 `155238` 点；RDS 到官方 TOP return1+return2 的最大 p99 为 `0.00403m`，最大 nearest-neighbor 距离为 `0.00552m`，均在厘米内。输出目录：
+
+```text
+outputs/waymo_official_lidar/validation/validation8_frame0/
+```
+
+单帧官方 range image/点云预览和 PLY：
+
+```text
+outputs/waymo_official_lidar/validation/10448102132863604198_472_000_492_000_smoke/preview/10448102132863604198_472_000_492_000_000000_official_top.png
+outputs/waymo_official_lidar/validation/10448102132863604198_472_000_492_000_smoke/ply/10448102132863604198_472_000_492_000_000000_top_return1.ply
+outputs/waymo_official_lidar/validation/10448102132863604198_472_000_492_000_smoke/ply/10448102132863604198_472_000_492_000_000000_top_return1_return2.ply
+```
+
+和当前训练输入的差别：同一个 `104481...` 前 29 帧，当前 raw-online projector 把 RDS xyz 投到 `64x1280` 后只有 `1744027` 个 valid pixel，约为官方 TOP return1+return2 点数的 `48.3%`，约为官方 TOP return1 valid 的 `50.6%`。即使用当前 generic projector 投到 `64x2650`，valid pixel 也是 `3326614`，仍低于官方 native grid 的 `3609503` return1+return2 点数；原因是它没有使用官方 range image 的原始 pixel index 和双 return 结构，而是把点云重新做 spherical binning，碰撞和分桶差异会继续带来损失。
+
+判断：`rds_hq` raw 点云抽取不是当前主要信息损失点。真正的输入格式损失发生在 `official [64,2650,4] range image -> rds_hq xyz -> generic 64x1280 range map` 这一步，尤其是横向从 `2650` 压到 `1280`、return1/return2 合并、以及 valid/invalid 仍由 range 数值隐式承载。后续若优化数据输入，优先方向应是直接读取官方 TOP range image，并显式选择 return policy：return1-only、return1+return2 双通道、或 return1 range + return2/valid/edge 辅助通道；在决定新训练合同前，需要先做 VAE roundtrip smoke 和固定 validation8 对照。
+
+#### 单帧 official raw range image -> 704x1280 VAE smoke
+
+按最新判断，先不在官方读取阶段压缩到 `64x1280`，而是导出官方原始 TOP range image：
+
+```text
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_range_image/range_npz/10448102132863604198_472_000_492_000_000000_top_raw_range_image.npz
+```
+
+该 npz 同时保存：
+
+- `range_image_return1`: `[64,2650,4]`
+- `range_image_return2`: `[64,2650,4]`
+- channel names: `range, intensity, elongation, nlz`
+
+VAE smoke 只取 `return1[...,0]` range 通道做指标，流程是：official raw `[64,2650,4]` -> range channel `[64,2650]` -> min-rebin width 到 `[64,1280]` -> `repeat_row=11` -> Wan input `[1,3,1,704,1280]` -> latent `[1,16,1,88,160]` -> decode。其它 3 个官方通道先只保存在 raw npz 中，没有混进当前 3-channel Wan 输入合同。
+
+单帧结果，对照同一帧旧 RDS xyz -> generic projector 口径：
+
+| source | valid pixels | normalized MSE | Range MAE | Range RMSE | Occ P/R/F1/IoU @5.25m | extra | missing |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| official raw return1 `[64,2650,4]` -> rebin `1280` | 61311 | 0.000643 | **0.4315m** | **0.9861m** | **0.8397 / 0.9930 / 0.9099 / 0.8347** | 11625 | 430 |
+| RDS xyz -> generic `64x1280` projector | 59172 | **0.000598** | 0.4340m | 0.9975m | 0.8260 / **0.9941** / 0.9023 / 0.8220 | 12390 | **347** |
+
+输出目录：
+
+```text
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_64x2650_to_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_rds_xyz_projected_64x1280_to_704x1280_wan21_vae/metrics.json
+```
+
+结论：在这一帧上，直接读官方 native range image 后再压到 `704x1280`，range MAE/RMSE 和 occupancy precision/F1 都比 RDS xyz 重新投影略好，而且保留的 valid pixel 更多。但改善幅度很小，说明单靠“官方读 raw 再 rebin 到 1280”不能解决 VAE invalid bleed；真正可能带来变化的是保留 `2650` 宽度、显式 valid/return 通道，或微调 LiDAR VAE。
+
+#### 2650 -> 1280 无损 folding VAE smoke
+
+继续测试把 `64x2650` 的横向列无损折到 `704x1280` 的纵向 slot 里，而不是在宽度上压缩。映射固定为每个原始 beam 分配 `11` 个纵向 slot；`2650` 列切成 3 个 chunk。VAE decode 后先 unfold 回 `64x2650`，再在官方原始 grid 上计算指标。
+
+进 VAE 前的 folding 自测覆盖了 `fold_sparse/fold_duplicate`、`beam_local/slot_major`、`contiguous/interleave`、`serpentine on/off`，以及 `fold_visual_copy/fold_visual_interp`，`max_abs_roundtrip=0`。也就是说下面的误差来自 frozen Wan2.1 VAE 对 folded layout 的重建，而不是 folding 本身丢信息。
+
+- `fold_sparse`: 每个原始 pixel 只放一次，packed valid `116711`。
+- `fold_duplicate`: 每个 chunk 在对应 slot group 内重复，packed valid `465431`，unfold 时对重复 slot 做 median 或 mean。
+- `fold_visual_copy`: 前 3 行保存真实数据，row2 后 1190 列填 `x[2559]`，后 8 行复制 row1；packed valid `640443`。
+- `fold_visual_interp`: 前 3 行保存真实数据，row2 后 1190 列填 `x[2649]`，后 8 行用 3 个 anchor 做 deterministic bilinear 扩展；packed valid `603399`。
+
+单帧 `104481...` frame 0，official return1 range 通道。参考项：
+
+| layout | eval grid | packed valid | normalized MSE | Range MAE | Range RMSE | Occ P/R/F1/IoU @5.25m | extra | missing |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| direct rebin `64x2650 -> 64x1280 -> repeat_row=11` | `64x1280` | 61311 | **0.000643** | **0.4315m** | **0.9861m** | **0.8397 / 0.9930 / 0.9099 / 0.8347** | **11625** | **430** |
+| direct rebin only, no VAE, broadcast back | `64x2650` | 61311 | - | 0.1473m | 1.2609m | **0.9183 / 0.9834 / 0.9497 / 0.9043** | **10208** | 1940 |
+| direct rebin + VAE, broadcast back | `64x2650` | 61311 | **0.000643** | **0.4909m** | **1.5358m** | 0.7717 / 0.9931 / 0.8685 / 0.7675 | 34295 | **808** |
+| `fold_sparse`, serpentine | `64x2650` | 116711 | 0.001370 | 1.9588m | 3.4454m | 0.7747 / 0.9915 / 0.8698 / 0.7696 | 33651 | 994 |
+| `fold_visual_copy` | `64x2650` | 640443 | 0.002722 | 2.0699m | 3.7366m | 0.7879 / 0.9727 / 0.8706 / 0.7709 | 30566 | 3182 |
+| `fold_visual_interp` | `64x2650` | 603399 | 0.003094 | 2.3395m | 3.9830m | 0.7568 / 0.9716 / 0.8509 / 0.7404 | 36441 | 3313 |
+
+`fold_duplicate` layout variants，均在 `64x2650` eval grid 上评估，packed valid 均为 `465431`：
+
+| row_order | slot_strategy | serpentine | reducer | normalized MSE | Range MAE | Range RMSE | Occ F1/IoU @5.25m | extra / missing |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `beam_local` | `contiguous` | off | mean | **0.003055** | **1.0033m** | **2.2473m** | 0.8559 / 0.7481 | 38499 / **594** |
+| `beam_local` | `contiguous` | on | mean | 0.003073 | 1.0070m | 2.2736m | 0.8542 / 0.7455 | 38837 / 753 |
+| `beam_local` | `contiguous` | off | median | **0.003055** | 1.0242m | 2.2914m | **0.8824 / 0.7895** | **29981** / 900 |
+| `beam_local` | `contiguous` | on | median | 0.003073 | 1.0282m | 2.3164m | 0.8799 / 0.7856 | 30479 / 1084 |
+| `slot_major` | `contiguous` | off | mean | 0.006320 | 1.6252m | 3.6468m | 0.8600 / 0.7544 | 36848 / 859 |
+| `slot_major` | `contiguous` | on | mean | 0.006354 | 1.6277m | 3.6586m | 0.8619 / 0.7573 | 36358 / 793 |
+| `slot_major` | `contiguous` | off | median | 0.006320 | 1.6441m | 3.6678m | 0.8647 / 0.7617 | 35134 / 1051 |
+| `slot_major` | `interleave` | off | mean | 0.006347 | 1.6449m | 3.6771m | 0.8607 / 0.7554 | 36508 / 971 |
+| `slot_major` | `interleave` | on | mean | 0.006361 | 1.6424m | 3.6788m | 0.8626 / 0.7584 | 35957 / 930 |
+| `slot_major` | `contiguous` | on | median | 0.006354 | 1.6467m | 3.6820m | 0.8665 / 0.7644 | 34666 / 1002 |
+| `slot_major` | `interleave` | off | median | 0.006347 | 1.6581m | 3.7005m | 0.8648 / 0.7617 | 35059 / 1103 |
+| `slot_major` | `interleave` | on | median | 0.006361 | 1.6560m | 3.7030m | 0.8664 / 0.7642 | 34573 / 1096 |
+| `beam_local` | `interleave` | on | median | 0.016378 | 2.9340m | 4.8697m | 0.8348 / 0.7164 | 43711 / 1783 |
+| `beam_local` | `interleave` | off | median | 0.016549 | 2.9664m | 4.9200m | 0.8363 / 0.7187 | 43096 / 1862 |
+| `beam_local` | `interleave` | on | mean | 0.016378 | 3.1258m | 4.9994m | 0.8271 / 0.7052 | 47957 / 586 |
+| `beam_local` | `interleave` | off | mean | 0.016549 | 3.1580m | 5.0336m | 0.8268 / 0.7048 | 47868 / 722 |
+
+补充测试 `polyphase3` layout：先对 `64x2650` 做 log normalize，再按 circular roll 后的 even/odd azimuth 拆成 C0/C1；C2 的前 45 列存 even tail，45-90 列存 odd tail，其余列放 C0/C1 的 valid-aware 低频均值。最后把 `3x64x1280` 纵向 repeat 或 bilinear interpolate 到 `3x704x1280` 输入 Wan VAE。pre-VAE 反变换在有效 range 上 `max_abs_roundtrip ~= 4.6e-5m`，invalid 可回到 0。
+
+| layout | roll | packed valid | normalized MSE | Range MAE | Range RMSE | Occ P/R/F1/IoU @5.25m | extra | missing |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `polyphase3_repeat` | 0 | 1917806 | 0.022628 | 1.6619m | 4.4733m | 0.8745 / 0.9860 / 0.9269 / 0.8638 | 16514 | 1634 |
+| `polyphase3_repeat` | 45 | 1914451 | 0.022668 | 1.6708m | 4.4324m | 0.8758 / 0.9858 / 0.9276 / 0.8649 | 16310 | 1656 |
+| `polyphase3_repeat` | 640 | 1895355 | 0.022083 | **1.5873m** | **4.1743m** | **0.8820 / 0.9853 / 0.9308 / 0.8705** | **15392** | 1716 |
+| `polyphase3_interp` | 0 | 2118798 | 0.015860 | 1.7187m | 4.4655m | 0.8593 / 0.9861 / 0.9184 / 0.8491 | 18838 | **1621** |
+| `polyphase3_interp` | 45 | 2115692 | 0.015845 | 1.7407m | 4.4884m | 0.8591 / 0.9858 / 0.9181 / 0.8487 | 18863 | 1655 |
+| `polyphase3_interp` | 640 | 2101291 | **0.015538** | 1.6593m | 4.2238m | 0.8662 / 0.9855 / 0.9220 / 0.8553 | 17766 | 1691 |
+
+Folding 输出：
+
+```text
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_sparse_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_duplicate_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_duplicate_mean_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_duplicate_{row_order}_{slot_strategy}_{reducer}_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_duplicate_{row_order}_{slot_strategy}_{reducer}_noserpentine_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_visual_copy_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_fold_visual_interp_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_polyphase3_{repeat,interp}_roll{0,45,640}_704x1280_wan21_vae/metrics.json
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_rebin1280_eval2650_wan21_vae/metrics.json
+```
+
+判断：`fold_duplicate` 可以小幅改进，最佳组合是 `beam_local + contiguous + no-serpentine`。mean reducer 的 range 最好，`MAE/RMSE=1.0033m/2.2473m`；median reducer 的 occupancy 最好，`F1/IoU=0.8824/0.7895`。`slot_major` 把同一个 slot 的所有 beam 连续放置，range error 明显变大；`beam_local + interleave` 最差，说明对 frozen Wan VAE 来说，相邻 image row 继续表示同一 beam 的局部重复更友好。`fold_visual_copy/interp` 虽然让输入更像稠密图像，且 folded-grid normalized MSE 看起来不高，但真实三行经 VAE 后污染更重，`MAE/RMSE=2.0699m/3.7366m` 和 `2.3395m/3.9830m`，不适合当前 frozen VAE。`polyphase3` 保留了水平局部连续性并使用 3 个通道，occupancy 明显最好，`polyphase3_repeat + roll=640` 达到 `F1/IoU=0.9308/0.8705`，extra 从 direct rebin 的 `34295` 降到 `15392`；但 range amplitude 误差仍大，`MAE/RMSE=1.5873m/4.1743m`，差于 direct rebin 和最佳 `fold_duplicate`。综合来看：不 fine-tune 时，direct rebin 仍是 range roundtrip 最稳 baseline；若目标是后续 fine-tune LiDAR VAE / 生成 occupancy 更干净的点云，`polyphase3_repeat + roll=640` 是目前最值得继续的输入表示。
+
+#### polyphase3 Wan2.1 VAE fine-tune
+
+2026-05-31 启动第一轮轻量 VAE fine-tune，只训练 Wan2.1 VAE 输入空间 reconstruction，不加入 `[64,2650]` rangemap loss。配置意图是先验证 VAE 能否适配 `polyphase3_repeat + roll=640` 表示本身；如果输入空间 loss 能稳定下降，再评估 decode 后的 `64x2650` range/occupancy 指标，之后再考虑加入 rangemap loss 或拉长 temporal window。
+
+运行配置：
+
+```text
+tmux session: vae_train
+script: scripts/train_waymo_lidar_wan21_vae_polyphase.py
+launcher: train_waymo_lidar_wan21_vae_polyphase.sh
+Wan repo: /team/hyh/code/Wan2.1
+init VAE: /team/hyh/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/f176dc95b4a70f53ce01c4b302851595e7322b00/tokenizer.pth
+data: /team/hyh/data/rds_hq_waymo/training/lidar_raw/*.tar
+layout: polyphase3_repeat, roll=640
+target/loss: normalized `[3,1,704,1280]` input reconstruction, `L1 + 0.1*MSE`
+rangemap loss: disabled
+num_frames: 1
+batch_size: 1
+lr: 1e-5
+max_steps: 50000
+save_every: 5000
+output: outputs/waymo_lidar_vae_finetune/polyphase3_repeat_roll640_inputloss_20260530_163700/
+```
+
+训练已跑到 `step=50000`，最终 checkpoint：
+
+```text
+outputs/waymo_lidar_vae_finetune/polyphase3_repeat_roll640_inputloss_20260530_163700/checkpoints/step_050000_model.pt
+outputs/waymo_lidar_vae_finetune/polyphase3_repeat_roll640_inputloss_20260530_163700/checkpoints/step_050000_train_state.pt
+```
+
+训练日志：
+
+```text
+step 1  loss 0.0565  l1 0.0547  mse 0.0179
+step 30 loss 0.0323  l1 0.0315  mse 0.0089
+step 200 loss 0.0252 l1 0.0243  mse 0.0083
+step 400 loss 0.0309 l1 0.0297  mse 0.0116
+step 50000 loss 0.0049 l1 0.0049 mse 0.0002
+```
+
+训练 loss 说明 VAE 已经明显适配单帧 `polyphase3_repeat + roll=640` packed 输入；但是否能替换主线 tokenizer 必须看 decode 回 rangemap 后的指标，尤其是 29 帧路径。
+
+2026-05-31 评估结果：
+
+| eval | model | frames | normalized MAE/MSE | range MAE/RMSE | occupancy P/R/F1/IoU | extra/missing |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| official raw return1 single frame | frozen Wan2.1 | 1 | 0.065159 / 0.022083 | 1.5873m / 4.1743m | 0.8820 / 0.9853 / 0.9308 / 0.8705 | 15392 / 1716 |
+| official raw return1 single frame | `step_050000` | 1 | **0.006698 / 0.000274** | **0.2138m / 0.6712m** | **0.9915 / 0.9843 / 0.9879 / 0.9761** | **980** / 1836 |
+| RDS validation8 frame0 mean | frozen Wan2.1 | 8 | 0.051270 / 0.016768 | 1.4989m / 4.2881m | 0.9282 / 0.9841 / 0.9550 / 0.9145 | 9884.4 / 2179.0 |
+| RDS validation8 frame0 mean | `step_050000` | 8 | **0.005907 / 0.000308** | **0.2397m / 0.8603m** | **0.9936 / 0.9841 / 0.9887 / 0.9779** | **812.1** / 2178.6 |
+| RDS validation clip `102036...`, frames 0-28 | frozen Wan2.1 | 29 | **0.077004 / 0.040005** | **2.7296m / 6.8782m** | 0.8871 / **0.9969** / **0.9388** / **0.8847** | 383920 / **9378** |
+| RDS validation clip `102036...`, frames 0-28 | `step_050000` | 29 | 0.099105 / 0.053050 | 3.5498m / 8.3630m | **0.8905** / 0.9922 / 0.9386 / 0.8844 | **369175** / 23500 |
+
+输出：
+
+```text
+single-frame official metrics + videos:
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_polyphase3_repeat_roll640_ft50000_704x1280_wan21_vae/
+
+704x1280 packed GT/GEN/error:
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_polyphase3_repeat_roll640_ft50000_704x1280_wan21_vae/packed_704x1280_gt_gen_error.png
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_polyphase3_repeat_roll640_ft50000_704x1280_wan21_vae/packed_704x1280_rgb_compare.png
+
+point cloud video:
+outputs/waymo_official_lidar_vae/validation/10448102132863604198_472_000_492_000_frame0_official_raw_return1_polyphase3_repeat_roll640_ft50000_704x1280_wan21_vae/point_cloud_front_view_vehicle.mp4
+
+validation8 summary:
+outputs/waymo_lidar_vae_eval/validation8_polyphase3_repeat_roll640/summary.json
+
+29-frame check:
+outputs/waymo_lidar_vae_eval/validation29_polyphase3_repeat_roll640/
+```
+
+判断：当前 `step_050000` 对单帧 VAE roundtrip 非常有效，validation8 frame0 mean 已达到此前设定的第一阶段成功标准：range MAE `<0.6m`、occupancy F1 `>0.97`。但它是在 `num_frames=1` 上训练的，直接用于 29 帧 encode/decode 时 range 指标反而差于 frozen Wan2.1，说明 temporal path 没有被正确适配，不能直接替换当前 29-frame 训练主线的 VAE/tokenizer。
+
+是否继续训练：不建议继续续训这个 `num_frames=1` run。下一轮如果要让 fine-tuned VAE 接入主线，应新开 `num_frames=29` 的 VAE fine-tune smoke，并以 29-frame validation clip 指标作为 early-stop 标准；或者先冻结/保护 temporal 模块，只微调空间 encoder/decoder，再验证 29-frame roundtrip。当前 `step_050000` 可以作为单帧表示实验和可视化参考，不作为主线 checkpoint。
+
+### 2026-05-30 validation8 roundtrip 与输入/VAE 优化判断
+
+固定 validation8 上补充了当前主线输入合同的纯 Wan2.1 VAE roundtrip：raw Waymo TOP -> `64x1280` -> `repeat_row=11` -> `[1,3,29,704,1280]` -> Wan VAE latent `[1,16,8,88,160]` -> decode -> range map。训练主线的 raw-online dataloader 也是直接从 raw tar 在线投影和 encode；`.mp4`/RDS 中间文件只用于调试展示或历史路径，不是当前训练 target 的有损中间件。
+
+结果目录：
+
+```text
+/team/hyh/data/waymo_wan_lidar_vae_smoke/validation/validation8_native64x1280_repeatrow11_metrics/
+```
+
+逐样本 range roundtrip 指标：
+
+| sample | VAE MAE | VAE RMSE | normalized MSE | valid pixels |
+| --- | ---: | ---: | ---: | ---: |
+| `10203656353524179475_7625_000_7645_000_0` | 0.9030 | 3.3258 | 0.006233 | 1566118 |
+| `1024360143612057520_3580_000_3600_000_0` | 0.5545 | 1.9229 | 0.002854 | 2036902 |
+| `10247954040621004675_2180_000_2200_000_0` | 0.4079 | 1.0232 | 0.000703 | 2167644 |
+| `10289507859301986274_4200_000_4220_000_0` | 0.6467 | 1.9556 | 0.002448 | 2158353 |
+| `10335539493577748957_1372_870_1392_870_0` | 1.0209 | 3.0199 | 0.005351 | 1980599 |
+| `10359308928573410754_720_000_740_000_0` | 0.4816 | 1.3271 | 0.001288 | 2140997 |
+| `10448102132863604198_472_000_492_000_0` | 0.8356 | 2.5819 | 0.004293 | 1744027 |
+| `10689101165701914459_2072_300_2092_300_0` | 1.0529 | 3.0544 | 0.005697 | 2154924 |
+| mean | **0.7379** | **2.2764** | **0.003608** | 1993696 |
+
+对照 raw-online generator `iter_000100000` validation8 mean 为 MAE/RMSE `2.1381m/5.5193m`，所以当前 VAE roundtrip 约占生成误差的 `35%` MAE 和 `41%` RMSE。结论是 VAE/表示不是唯一瓶颈，但已经足够大，不能当作无损编码层处理。
+
+用评估脚本相同的 `pred_valid = range > 5.25m` 口径看，冻结 Wan VAE 本身会把不少 invalid 背景解成刚超过阈值的近距离点：
+
+```text
+GT valid                15949564
+VAE decoded valid       17410227
+matched valid           15725913
+decoded extra            1684314
+decoded missing           223651
+occupancy P/R/F1/IoU     0.9033 / 0.9860 / 0.9428 / 0.8918
+edge P/R/F1/IoU          0.7439 / 0.9417 / 0.8312 / 0.7111
+```
+
+这和 generator 的错误形态不同：`iter_000100000` generated extra/missing 是 `934140 / 607340`。也就是说，VAE 的 invalid bleed 倾向于高 recall、低 precision；训练后的 generator 又学成了更保守的 occupancy，extra 下降但 missing 上升。
+
+阈值 sweep 只作为 decode 诊断，不代表最终方案：
+
+| valid threshold | precision | recall | F1 | IoU | extra | missing |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5.25m | 0.9033 | 0.9860 | 0.9428 | 0.8918 | 1684314 | 223651 |
+| 5.50m | 0.9576 | 0.9718 | 0.9647 | 0.9317 | 686428 | 449100 |
+| 6.00m | 0.9742 | 0.9623 | **0.9682** | **0.9384** | 405685 | 601509 |
+| 7.00m | 0.9835 | 0.9301 | 0.9561 | 0.9159 | 248147 | 1114285 |
+
+判断与下一步：
+
+- 保留当前主线 `64x1280 + repeat_row=11 + latent 88x160` 作为 baseline。`1312x11` 纯 VAE 略好，但 latent width 变成 `164`；`1280x12` 单条 clip 也略好，但高度变成 `768`。这两类 shape 改动会牵动 single-view 配置和位置网格，短期收益不值得先动。
+- 低风险优先做 decode/occupancy 校准实验：在固定 validation8 上比较 `5.25m/5.5m/6.0m` 阈值、layout valid mask gating、以及小范围 per-sample-free 的全局阈值。成功标准应同时看 range MAE/RMSE、extra/missing 和点云视频，不能只最大化 occupancy F1。
+- 真正的数据表示优化应把 valid/invalid 从 range 数值里拆出来。当前 `repeat_depth` 把 invalid 压在 `-1`，decode 后 `-1` 附近的小漂移就会变成 5m 附近假点。候选 3 通道合同：`range + valid + edge` 或 `range + valid + log/inverse-range`。这会改变 VAE 输入语义，不能直接替换主线，需要先做 VAE roundtrip smoke，再接小规模 diffusion 复训。
+- VAE 优化建议从“保持 latent 合同不变”的 LiDAR VAE fine-tune 开始：输入/输出仍为 `[3,29,704,1280] -> [16,8,88,160]`，初始化 Wan2.1 VAE，训练重建时加入 valid mask BCE、valid range L1/Charbonnier、edge/discontinuity 权重和 invalid sentinel 约束。第一阶段只验证 VAE roundtrip 是否把 validation8 mean MAE 压到 `<0.6m`、并在固定 `5.25m` 下把 occupancy F1 提到 `>0.97`；达不到前不接大规模生成训练。
+- 不建议继续优先尝试 CogVideoX1.5 VAE；已有 smoke 显示它在这个 rangemap 分布上明显差于 Wan2.1。
+
 ### CogVideo 观察
 
 - CogVideoX1.5 VAE 可以在 GPU 上对 native Waymo rangemap tensor 正常 encode/decode，开启 tiling 后可跑通。

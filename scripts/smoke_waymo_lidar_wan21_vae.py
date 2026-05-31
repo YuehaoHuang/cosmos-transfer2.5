@@ -33,6 +33,7 @@ DEFAULT_RAW_LIDAR_ROOT = "/data2/rds_hq_waymo"
 WAN_HF_REPO_CACHE = "models--nvidia--Cosmos-Predict2.5-2B"
 WAN_HF_REVISION = "f176dc95b4a70f53ce01c4b302851595e7322b00"
 WAN_HF_FILENAME = "tokenizer.pth"
+POLYPHASE3_LAYOUTS = {"polyphase3_repeat", "polyphase3_interp"}
 
 
 # Waymo TOP LiDAR calibration, matching
@@ -136,6 +137,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--converted-lidar-root", default="/data2/rds_hq_waymo/lidar_tokenizer")
     parser.add_argument("--converted-tar", default=None)
     parser.add_argument("--raw-tar", default=None, help="Optional raw lidar tar.")
+    parser.add_argument("--range-map-npz", default=None, help="Optional precomputed range map npz with `range_maps`.")
+    parser.add_argument("--range-map-return", default="return1", choices=["return1", "return2"])
+    parser.add_argument("--range-map-target-width", type=int, default=None)
+    parser.add_argument("--range-map-eval-source-grid", action="store_true")
+    parser.add_argument(
+        "--range-map-layout",
+        default="plain",
+        choices=[
+            "plain",
+            "fold_sparse",
+            "fold_duplicate",
+            "fold_visual_copy",
+            "fold_visual_interp",
+            "polyphase3_repeat",
+            "polyphase3_interp",
+        ],
+        help="Optional lossless fold from 64x2650 official range maps into a 704x1280 Wan input grid.",
+    )
+    parser.add_argument("--fold-target-height", type=int, default=704)
+    parser.add_argument("--fold-target-width", type=int, default=1280)
+    parser.add_argument("--fold-row-order", default="beam_local", choices=["beam_local", "slot_major"])
+    parser.add_argument("--fold-slot-strategy", default="contiguous", choices=["contiguous", "interleave"])
+    parser.add_argument("--fold-serpentine", dest="fold_serpentine", action="store_true", default=True)
+    parser.add_argument("--no-fold-serpentine", dest="fold_serpentine", action="store_false")
+    parser.add_argument("--fold-duplicate-reducer", default="median", choices=["mean", "median"])
+    parser.add_argument("--polyphase-roll", type=int, default=0)
     parser.add_argument("--native-n-rows", type=int, default=64)
     parser.add_argument("--native-n-cols", type=int, default=2650)
     parser.add_argument("--projection-max-range", type=float, default=105.0)
@@ -177,9 +204,9 @@ def apply_mode_defaults(args: argparse.Namespace) -> None:
     if args.downsample_factor_row is None:
         args.downsample_factor_row = 1
     if args.downsample_factor_col is None:
-        args.downsample_factor_col = 2 if args.preprocess_mode == "tokenizer_128x3600" else 1
+        args.downsample_factor_col = 1 if args.range_map_layout != "plain" else (2 if args.preprocess_mode == "tokenizer_128x3600" else 1)
     if args.repeat_row is None:
-        args.repeat_row = 4 if args.preprocess_mode == "tokenizer_128x3600" else 16
+        args.repeat_row = 1 if args.range_map_layout != "plain" else (4 if args.preprocess_mode == "tokenizer_128x3600" else 16)
     if args.repeat_col is None:
         args.repeat_col = 1
     if args.decode_channel_mode is None:
@@ -331,6 +358,322 @@ def load_raw_range_maps(
     return np.stack(range_maps, axis=0), selected_names
 
 
+def rebin_range_maps_width_min(range_maps: np.ndarray, target_width: int) -> np.ndarray:
+    if target_width <= 0:
+        raise ValueError(f"target_width must be positive, got {target_width}")
+    if range_maps.shape[-1] == target_width:
+        return range_maps.astype(np.float32, copy=False)
+    source_width = range_maps.shape[-1]
+    source_cols = np.arange(source_width, dtype=np.float64)
+    target_cols = np.floor((source_cols + 0.5) * target_width / source_width).astype(np.int64)
+    target_cols = np.clip(target_cols, 0, target_width - 1)
+    output = np.zeros((*range_maps.shape[:-1], target_width), dtype=np.float32)
+    flat_input = range_maps.reshape(-1, source_width)
+    flat_output = output.reshape(-1, target_width)
+    for row_idx, values in enumerate(flat_input):
+        accum = np.full(target_width, np.inf, dtype=np.float32)
+        valid = values > 0
+        if valid.any():
+            np.minimum.at(accum, target_cols[valid], values[valid].astype(np.float32, copy=False))
+        flat_output[row_idx] = np.where(np.isfinite(accum), accum, 0.0)
+    return output
+
+
+def expand_rebinned_range_maps_width(rebinned: np.ndarray, source_width: int) -> np.ndarray:
+    target_width = rebinned.shape[-1]
+    source_cols = np.arange(source_width, dtype=np.float64)
+    target_cols = np.floor((source_cols + 0.5) * target_width / source_width).astype(np.int64)
+    target_cols = np.clip(target_cols, 0, target_width - 1)
+    return rebinned[..., target_cols].astype(np.float32, copy=False)
+
+
+def load_npz_range_maps(path: Path, *, range_return: str) -> tuple[np.ndarray, list[str]]:
+    payload = np.load(path, allow_pickle=True)
+    if "range_maps" in payload:
+        range_maps = payload["range_maps"].astype(np.float32)
+    else:
+        key = f"range_image_{range_return}"
+        range_image = payload[key].astype(np.float32)
+        range_maps = range_image[..., 0]
+    if range_maps.ndim == 2:
+        range_maps = range_maps[None]
+    if "frame_names" in payload:
+        frame_names = [str(item) for item in payload["frame_names"].tolist()]
+    else:
+        frame_names = [f"frame_{idx:06d}" for idx in range(range_maps.shape[0])]
+    return range_maps, frame_names
+
+
+def fold_chunk_groups(slots_per_row: int, num_chunks: int, *, strategy: str) -> list[list[int]]:
+    if strategy == "interleave":
+        return [list(range(chunk_idx, slots_per_row, num_chunks)) for chunk_idx in range(num_chunks)]
+    if strategy != "contiguous":
+        raise ValueError(f"Unsupported fold slot strategy: {strategy}")
+    base = slots_per_row // num_chunks
+    extra = slots_per_row % num_chunks
+    groups: list[list[int]] = []
+    start = 0
+    for chunk_idx in range(num_chunks):
+        size = base + (1 if chunk_idx < extra else 0)
+        groups.append(list(range(start, start + size)))
+        start += size
+    return groups
+
+
+def fold_row_indices(source_height: int, slots_per_row: int, slot: int, *, row_order: str) -> np.ndarray:
+    beam_rows = np.arange(source_height)
+    if row_order == "beam_local":
+        return beam_rows * slots_per_row + slot
+    if row_order == "slot_major":
+        return slot * source_height + beam_rows
+    raise ValueError(f"Unsupported fold row order: {row_order}")
+
+
+def fold_sparse_slots(slots_per_row: int, num_chunks: int) -> list[int]:
+    if num_chunks == 1:
+        return [slots_per_row // 2]
+    return [int(round(idx * (slots_per_row - 1) / (num_chunks - 1))) for idx in range(num_chunks)]
+
+
+def fold_visual_fill_range_maps_to_wan_grid(
+    range_maps: np.ndarray,
+    *,
+    mode: str,
+    target_height: int,
+    target_width: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    frames, source_height, source_width = range_maps.shape
+    if target_height % source_height != 0:
+        raise ValueError(f"target_height {target_height} is not divisible by source_height {source_height}")
+    slots_per_row = target_height // source_height
+    if slots_per_row < 3:
+        raise ValueError(f"Need at least 3 slots per row for visual fill, got {slots_per_row}")
+    if target_width != 1280 or source_width != 2650:
+        raise ValueError(f"Visual fill layouts expect source_width=2650 and target_width=1280, got {source_width}->{target_width}")
+
+    output = np.zeros((frames, target_height, target_width), dtype=np.float32)
+    for beam_idx in range(source_height):
+        base = beam_idx * slots_per_row
+        r0 = range_maps[:, beam_idx, 0:1280].astype(np.float32, copy=False)
+        r1 = range_maps[:, beam_idx, 1280:2560].astype(np.float32, copy=False)
+        r2 = np.empty((frames, target_width), dtype=np.float32)
+        r2[:, :90] = range_maps[:, beam_idx, 2560:2650].astype(np.float32, copy=False)
+        if mode == "fold_visual_copy":
+            r2[:, 90:] = range_maps[:, beam_idx, 2559:2560].astype(np.float32, copy=False)
+            output[:, base + 0, :] = r0
+            output[:, base + 1, :] = r1
+            output[:, base + 2, :] = r2
+            output[:, base + 3 : base + slots_per_row, :] = r1[:, None, :]
+        elif mode == "fold_visual_interp":
+            r2[:, 90:] = range_maps[:, beam_idx, 2649:2650].astype(np.float32, copy=False)
+            anchors = np.stack([r0, r1, r2], axis=1)
+            positions = np.linspace(0.0, 2.0, slots_per_row, dtype=np.float32)
+            lower = np.floor(positions).astype(np.int64)
+            upper = np.clip(lower + 1, 0, 2)
+            alpha = (positions - lower).astype(np.float32)
+            smooth = anchors[:, lower, :] * (1.0 - alpha[None, :, None]) + anchors[:, upper, :] * alpha[None, :, None]
+            smooth[:, 0, :] = r0
+            smooth[:, 1, :] = r1
+            smooth[:, 2, :] = r2
+            output[:, base : base + slots_per_row, :] = smooth
+        else:
+            raise ValueError(f"Unsupported visual fill mode: {mode}")
+
+    info = {
+        "mode": mode,
+        "source_shape": [int(frames), int(source_height), int(source_width)],
+        "target_shape": [int(frames), int(target_height), int(target_width)],
+        "slots_per_row": int(slots_per_row),
+        "real_slots": [0, 1, 2],
+        "source_valid_pixels": int((range_maps > 0).sum()),
+        "packed_valid_pixels": int((output > 0).sum()),
+    }
+    return output, info
+
+
+def fold_range_maps_to_wan_grid(
+    range_maps: np.ndarray,
+    *,
+    mode: str,
+    target_height: int,
+    target_width: int,
+    row_order: str,
+    slot_strategy: str,
+    serpentine: bool,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if mode in {"fold_visual_copy", "fold_visual_interp"}:
+        return fold_visual_fill_range_maps_to_wan_grid(
+            range_maps,
+            mode=mode,
+            target_height=target_height,
+            target_width=target_width,
+        )
+    if mode not in {"fold_sparse", "fold_duplicate"}:
+        raise ValueError(f"Unsupported fold mode: {mode}")
+    frames, source_height, source_width = range_maps.shape
+    if target_height % source_height != 0:
+        raise ValueError(f"target_height {target_height} is not divisible by source_height {source_height}")
+    slots_per_row = target_height // source_height
+    num_chunks = int(np.ceil(source_width / target_width))
+    if num_chunks > slots_per_row:
+        raise ValueError(f"Need {num_chunks} chunks but only {slots_per_row} vertical slots are available")
+
+    output = np.zeros((frames, target_height, target_width), dtype=np.float32)
+    sparse_slots = fold_sparse_slots(slots_per_row, num_chunks)
+    duplicate_groups = fold_chunk_groups(slots_per_row, num_chunks, strategy=slot_strategy)
+    for chunk_idx in range(num_chunks):
+        start_col = chunk_idx * target_width
+        end_col = min((chunk_idx + 1) * target_width, source_width)
+        chunk = range_maps[:, :, start_col:end_col].astype(np.float32, copy=False)
+        if serpentine and chunk_idx % 2 == 1:
+            chunk = chunk[:, :, ::-1]
+        slots = [sparse_slots[chunk_idx]] if mode == "fold_sparse" else duplicate_groups[chunk_idx]
+        for slot in slots:
+            output[:, fold_row_indices(source_height, slots_per_row, slot, row_order=row_order), : end_col - start_col] = chunk
+
+    info = {
+        "mode": mode,
+        "source_shape": [int(frames), int(source_height), int(source_width)],
+        "target_shape": [int(frames), int(target_height), int(target_width)],
+        "slots_per_row": int(slots_per_row),
+        "num_chunks": int(num_chunks),
+        "sparse_slots": sparse_slots,
+        "duplicate_groups": duplicate_groups,
+        "serpentine": serpentine,
+        "row_order": row_order,
+        "slot_strategy": slot_strategy,
+        "source_valid_pixels": int((range_maps > 0).sum()),
+        "packed_valid_pixels": int((output > 0).sum()),
+    }
+    return output, info
+
+
+def unfold_wan_grid_to_range_maps(
+    folded: np.ndarray,
+    *,
+    source_height: int,
+    source_width: int,
+    mode: str,
+    row_order: str,
+    slot_strategy: str,
+    serpentine: bool,
+    duplicate_reducer: str,
+) -> np.ndarray:
+    frames, target_height, target_width = folded.shape
+    slots_per_row = target_height // source_height
+    if mode in {"fold_visual_copy", "fold_visual_interp"}:
+        if target_width != 1280 or source_width != 2650:
+            raise ValueError(f"Visual fill layouts expect source_width=2650 and target_width=1280, got {source_width}->{target_width}")
+        output = np.zeros((frames, source_height, source_width), dtype=np.float32)
+        for beam_idx in range(source_height):
+            base = beam_idx * slots_per_row
+            output[:, beam_idx, 0:1280] = folded[:, base + 0, :]
+            output[:, beam_idx, 1280:2560] = folded[:, base + 1, :]
+            output[:, beam_idx, 2560:2650] = folded[:, base + 2, :90]
+        return output
+    num_chunks = int(np.ceil(source_width / target_width))
+    sparse_slots = fold_sparse_slots(slots_per_row, num_chunks)
+    duplicate_groups = fold_chunk_groups(slots_per_row, num_chunks, strategy=slot_strategy)
+    output = np.zeros((frames, source_height, source_width), dtype=np.float32)
+    for chunk_idx in range(num_chunks):
+        start_col = chunk_idx * target_width
+        end_col = min((chunk_idx + 1) * target_width, source_width)
+        slots = [sparse_slots[chunk_idx]] if mode == "fold_sparse" else duplicate_groups[chunk_idx]
+        rows = [fold_row_indices(source_height, slots_per_row, slot, row_order=row_order) for slot in slots]
+        values = np.stack([folded[:, row_idx, : end_col - start_col] for row_idx in rows], axis=0)
+        if mode == "fold_duplicate" and duplicate_reducer == "mean":
+            chunk = values.mean(axis=0)
+        else:
+            chunk = np.median(values, axis=0)
+        if serpentine and chunk_idx % 2 == 1:
+            chunk = chunk[:, :, ::-1]
+        output[:, :, start_col:end_col] = chunk
+    return output
+
+
+def log_normalize_range_maps(range_maps: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    valid = range_maps > 0
+    clipped = np.clip(range_maps.astype(np.float32, copy=False), args.min_range, args.max_range)
+    log_min = np.log(args.min_range)
+    log_max = np.log(args.max_range)
+    normalized = (np.log(clipped) - log_min) / (log_max - log_min)
+    normalized = normalized * 2.0 - 1.0 if args.min_value == -1 else normalized
+    return np.where(valid, normalized, args.min_value).astype(np.float32)
+
+
+def log_unnormalize_range_maps(normalized: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    clipped = np.clip(normalized.astype(np.float32, copy=False), args.min_value, 1.0)
+    if args.min_value == -1:
+        unit = (clipped + 1.0) * 0.5
+    else:
+        unit = clipped
+    log_min = np.log(args.min_range)
+    log_max = np.log(args.max_range)
+    ranges = np.exp(unit * (log_max - log_min) + log_min).astype(np.float32)
+    ranges[clipped <= args.min_value + 1e-6] = 0.0
+    return ranges
+
+
+def encode_polyphase3_normalized(range_maps: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    frames, source_height, source_width = range_maps.shape
+    if source_height != 64 or source_width != 2650:
+        raise ValueError(f"polyphase3 layouts expect 64x2650 range maps, got {source_height}x{source_width}")
+    rolled = np.roll(log_normalize_range_maps(range_maps, args), shift=args.polyphase_roll, axis=2)
+    even = rolled[:, :, 0::2]
+    odd = rolled[:, :, 1::2]
+    c0 = even[:, :, :1280]
+    c1 = odd[:, :, :1280]
+
+    c0_valid = c0 > args.min_value
+    c1_valid = c1 > args.min_value
+    low = np.full((frames, source_height, 1280), args.min_value, dtype=np.float32)
+    both = c0_valid & c1_valid
+    only_c0 = c0_valid & ~c1_valid
+    only_c1 = c1_valid & ~c0_valid
+    low[both] = (c0[both] + c1[both]) * 0.5
+    low[only_c0] = c0[only_c0]
+    low[only_c1] = c1[only_c1]
+
+    c2 = low.copy()
+    c2[:, :, :45] = even[:, :, 1280:1325]
+    c2[:, :, 45:90] = odd[:, :, 1280:1325]
+    return np.stack([c0, c1, c2], axis=1).astype(np.float32)
+
+
+def expand_polyphase3_vertical(channels: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    if args.range_map_layout == "polyphase3_repeat":
+        return np.repeat(channels, 11, axis=2).astype(np.float32)
+    if args.range_map_layout == "polyphase3_interp":
+        tensor = torch.from_numpy(channels).float()
+        expanded = F.interpolate(tensor, size=(704, 1280), mode="bilinear", align_corners=True)
+        return expanded.numpy().astype(np.float32)
+    raise ValueError(f"Unsupported polyphase3 layout: {args.range_map_layout}")
+
+
+def preprocess_polyphase3_range_maps(
+    range_maps: np.ndarray, args: argparse.Namespace
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    channels = encode_polyphase3_normalized(range_maps, args)
+    expanded = expand_polyphase3_vertical(channels, args)
+    tensor = torch.from_numpy(expanded).float().permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+    return tensor, range_maps.astype(np.float32, copy=False), range_maps > 0
+
+
+def make_polyphase3_layout_info(range_maps: np.ndarray, args: argparse.Namespace) -> dict[str, Any]:
+    channels = encode_polyphase3_normalized(range_maps, args)
+    expanded = expand_polyphase3_vertical(channels, args)
+    return {
+        "mode": args.range_map_layout,
+        "source_shape": [int(v) for v in range_maps.shape],
+        "target_shape": [int(range_maps.shape[0]), 3, 704, 1280],
+        "polyphase_roll": int(args.polyphase_roll),
+        "source_valid_pixels": int((range_maps > 0).sum()),
+        "packed_valid_pixels": int((expanded > args.min_value).sum()),
+        "tail_layout": "C2[:, :45]=even_tail, C2[:, 45:90]=odd_tail, C2[:, 90:]=valid_aware_low_frequency_mean",
+        "normalization": "log_range_to_min_value_1",
+    }
+
+
 def prepend_lidar_utils_repo(repo_path: str) -> None:
     resolved = str(Path(repo_path).resolve())
     if resolved not in sys.path:
@@ -340,6 +683,9 @@ def prepend_lidar_utils_repo(repo_path: str) -> None:
 def preprocess_range_maps(
     range_maps: np.ndarray, args: argparse.Namespace
 ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    if args.range_map_layout in POLYPHASE3_LAYOUTS:
+        return preprocess_polyphase3_range_maps(range_maps, args)
+
     from cosmos_predict1.utils.lidar_rangemap import RangeMapDownsampler, normalize_range_map
 
     downsampler = RangeMapDownsampler(
@@ -579,6 +925,36 @@ def decode_reconstruction_range(
     raise ValueError(f"Unsupported decode channel mode: {args.decode_channel_mode}")
 
 
+def decode_polyphase3_reconstruction_range(video_tensor: torch.Tensor, args: argparse.Namespace) -> np.ndarray:
+    channels = video_tensor[0].detach().cpu().float().permute(1, 0, 2, 3)
+    if args.range_map_layout == "polyphase3_repeat":
+        frames = channels.shape[0]
+        channels = channels[:, :, :704, :1280].reshape(frames, 3, 64, 11, 1280).mean(dim=3)
+    elif args.range_map_layout == "polyphase3_interp":
+        channels = F.interpolate(channels[:, :, :704, :1280], size=(64, 1280), mode="bilinear", align_corners=True)
+    else:
+        raise ValueError(f"Unsupported polyphase3 layout: {args.range_map_layout}")
+
+    normalized = channels.numpy().astype(np.float32)
+    c0 = log_unnormalize_range_maps(normalized[:, 0], args)
+    c1 = log_unnormalize_range_maps(normalized[:, 1], args)
+    c2 = log_unnormalize_range_maps(normalized[:, 2], args)
+
+    frames = normalized.shape[0]
+    source_height = normalized.shape[2]
+    even = np.zeros((frames, source_height, 1325), dtype=np.float32)
+    odd = np.zeros((frames, source_height, 1325), dtype=np.float32)
+    even[:, :, :1280] = c0
+    odd[:, :, :1280] = c1
+    even[:, :, 1280:1325] = c2[:, :, :45]
+    odd[:, :, 1280:1325] = c2[:, :, 45:90]
+
+    rolled = np.zeros((frames, source_height, 2650), dtype=np.float32)
+    rolled[:, :, 0::2] = even
+    rolled[:, :, 1::2] = odd
+    return np.roll(rolled, shift=-args.polyphase_roll, axis=2).astype(np.float32)
+
+
 def colorize_depth_maps(range_maps: np.ndarray, valid_mask: np.ndarray, *, cmap_name: str = "turbo") -> np.ndarray:
     from matplotlib import colormaps
 
@@ -694,6 +1070,7 @@ def build_metrics(
     wan_input_tensor_shape: tuple[int, ...],
     wan_reconstruction_shape: tuple[int, ...],
     spatial_padding: dict[str, int],
+    range_map_layout_info: dict[str, Any] | None,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     input_float = input_tensor.detach().cpu().float()
@@ -712,6 +1089,15 @@ def build_metrics(
         range_mae = None
         range_rmse = None
         range_max_abs = None
+
+    generated_valid = np.isfinite(reconstruction_range) & (reconstruction_range > args.min_range + 0.25)
+    matched_valid = valid_mask & generated_valid
+    generated_extra = generated_valid & ~valid_mask
+    generated_missing = valid_mask & ~generated_valid
+    precision = float(matched_valid.sum() / max(generated_valid.sum(), 1))
+    recall = float(matched_valid.sum() / max(valid_mask.sum(), 1))
+    f1 = float(2.0 * precision * recall / max(precision + recall, 1e-12))
+    iou = float(matched_valid.sum() / max((valid_mask | generated_valid).sum(), 1))
 
     return {
         "segment_key": args.segment_key,
@@ -733,6 +1119,15 @@ def build_metrics(
         "range_mae_m": range_mae,
         "range_rmse_m": range_rmse,
         "range_max_abs_m": range_max_abs,
+        "generated_valid_threshold_m": float(args.min_range + 0.25),
+        "generated_valid_pixel_count": int(generated_valid.sum()),
+        "matched_valid_pixel_count": int(matched_valid.sum()),
+        "generated_extra_pixel_count": int(generated_extra.sum()),
+        "generated_missing_pixel_count": int(generated_missing.sum()),
+        "occupancy_precision": precision,
+        "occupancy_recall": recall,
+        "occupancy_f1": f1,
+        "occupancy_iou": iou,
         "preprocess": {
             "downsample_factor_row": args.downsample_factor_row,
             "downsample_factor_col": args.downsample_factor_col,
@@ -749,6 +1144,15 @@ def build_metrics(
             "native_n_cols": args.native_n_cols,
             "projection_max_range": args.projection_max_range,
             "wan_spatial_align": args.wan_spatial_align,
+            "range_map_target_width": args.range_map_target_width,
+            "range_map_eval_source_grid": args.range_map_eval_source_grid,
+            "range_map_layout": args.range_map_layout,
+            "range_map_layout_info": range_map_layout_info,
+            "fold_row_order": args.fold_row_order,
+            "fold_slot_strategy": args.fold_slot_strategy,
+            "fold_serpentine": args.fold_serpentine,
+            "fold_duplicate_reducer": args.fold_duplicate_reducer,
+            "polyphase_roll": args.polyphase_roll,
         },
     }
 
@@ -765,7 +1169,25 @@ def main() -> None:
     model_dtype = getattr(torch, args.dtype)
     save_dtype = getattr(torch, args.save_dtype)
 
-    if args.preprocess_mode == "waymo_top_64x2650":
+    range_map_layout_info: dict[str, Any] | None = None
+    fold_source_range_maps: np.ndarray | None = None
+    polyphase_source_range_maps: np.ndarray | None = None
+    rebin_source_range_maps: np.ndarray | None = None
+
+    if args.range_map_npz:
+        source_tar = Path(args.range_map_npz)
+        print(f"[load] precomputed range map npz: {source_tar}", flush=True)
+        range_maps, selected_frame_names = load_npz_range_maps(source_tar, range_return=args.range_map_return)
+        if args.range_map_target_width is not None:
+            if args.range_map_layout != "plain":
+                raise ValueError("--range-map-target-width is incompatible with folded range-map layouts")
+            if args.range_map_eval_source_grid:
+                rebin_source_range_maps = range_maps.astype(np.float32, copy=True)
+            range_maps = rebin_range_maps_width_min(range_maps, args.range_map_target_width)
+        args.num_frames = int(range_maps.shape[0])
+        args.native_n_rows = int(range_maps.shape[1])
+        args.native_n_cols = int(range_maps.shape[2])
+    elif args.preprocess_mode == "waymo_top_64x2650":
         source_tar = (
             Path(args.raw_tar)
             if args.raw_tar
@@ -806,6 +1228,28 @@ def main() -> None:
             num_frames=args.num_frames,
             pad_last=args.pad_last,
         )
+
+    source_range_map_shape = tuple(range_maps.shape)
+    if args.range_map_layout != "plain":
+        if args.range_map_layout in POLYPHASE3_LAYOUTS:
+            polyphase_source_range_maps = range_maps.astype(np.float32, copy=True)
+            range_map_layout_info = make_polyphase3_layout_info(polyphase_source_range_maps, args)
+            print(f"[layout] polyphase3 range maps: {tuple(source_range_map_shape)} -> (T, 3, 704, 1280)", flush=True)
+        else:
+            fold_source_range_maps = range_maps.astype(np.float32, copy=True)
+            range_maps, range_map_layout_info = fold_range_maps_to_wan_grid(
+                fold_source_range_maps,
+                mode=args.range_map_layout,
+                target_height=args.fold_target_height,
+                target_width=args.fold_target_width,
+                row_order=args.fold_row_order,
+                slot_strategy=args.fold_slot_strategy,
+                serpentine=args.fold_serpentine,
+            )
+            args.native_n_rows = int(range_maps.shape[1])
+            args.native_n_cols = int(range_maps.shape[2])
+            print(f"[layout] folded range maps: {tuple(source_range_map_shape)} -> {tuple(range_maps.shape)}", flush=True)
+        print(f"[layout] {json.dumps(range_map_layout_info, sort_keys=True)}", flush=True)
 
     if args.preprocess_mode == "tokenizer_128x3600":
         output_name = args.segment_key
@@ -866,27 +1310,55 @@ def main() -> None:
         skip_tensors=args.skip_tensors,
     )
 
-    recon_range = decode_reconstruction_range(
-        reconstruction,
-        args=args,
-        target_height=downsampled_range.shape[1],
-        target_width=downsampled_range.shape[2],
-    )
-    error_range = np.abs(recon_range - np.clip(downsampled_range, args.min_range, args.max_range))
+    if args.range_map_layout in POLYPHASE3_LAYOUTS:
+        recon_range = decode_polyphase3_reconstruction_range(reconstruction, args)
+    else:
+        recon_range = decode_reconstruction_range(
+            reconstruction,
+            args=args,
+            target_height=downsampled_range.shape[1],
+            target_width=downsampled_range.shape[2],
+        )
+    metric_input_range = downsampled_range
+    metric_recon_range = recon_range
+    metric_valid_mask = valid_mask
+    if polyphase_source_range_maps is not None:
+        metric_input_range = polyphase_source_range_maps
+        metric_recon_range = recon_range
+        metric_valid_mask = metric_input_range > 0
+    elif fold_source_range_maps is not None:
+        metric_input_range = fold_source_range_maps
+        metric_recon_range = unfold_wan_grid_to_range_maps(
+            recon_range,
+            source_height=fold_source_range_maps.shape[1],
+            source_width=fold_source_range_maps.shape[2],
+            mode=args.range_map_layout,
+            row_order=args.fold_row_order,
+            slot_strategy=args.fold_slot_strategy,
+            serpentine=args.fold_serpentine,
+            duplicate_reducer=args.fold_duplicate_reducer,
+        )
+        metric_valid_mask = metric_input_range > 0
+    elif rebin_source_range_maps is not None:
+        metric_input_range = rebin_source_range_maps
+        metric_recon_range = expand_rebinned_range_maps_width(recon_range, rebin_source_range_maps.shape[2])
+        metric_valid_mask = metric_input_range > 0
+    error_range = np.abs(metric_recon_range - np.clip(metric_input_range, args.min_range, args.max_range))
 
     metrics = build_metrics(
         input_tensor=input_tensor,
         latent=latent,
         reconstruction=reconstruction,
-        input_range=downsampled_range,
-        reconstruction_range=recon_range,
-        valid_mask=valid_mask,
+        input_range=metric_input_range,
+        reconstruction_range=metric_recon_range,
+        valid_mask=metric_valid_mask,
         selected_frame_names=selected_frame_names,
         source_tar=source_tar,
-        source_range_map_shape=tuple(range_maps.shape),
+        source_range_map_shape=source_range_map_shape,
         wan_input_tensor_shape=tuple(wan_input_tensor.shape),
         wan_reconstruction_shape=tuple(wan_reconstruction.shape),
         spatial_padding=spatial_padding,
+        range_map_layout_info=range_map_layout_info,
         args=args,
     )
     metrics_path = output_dir / "metrics.json"

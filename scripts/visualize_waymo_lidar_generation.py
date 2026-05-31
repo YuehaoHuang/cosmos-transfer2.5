@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-range", type=float, default=100.0)
     parser.add_argument("--min-value", type=float, default=-1.0)
     parser.add_argument("--valid-min-offset-m", type=float, default=0.25)
+    parser.add_argument(
+        "--generated-valid-threshold-m",
+        type=float,
+        default=None,
+        help="Optional absolute generated-valid threshold in meters. Defaults to min_range + valid_min_offset_m.",
+    )
     parser.add_argument("--near-buffer", type=float, default=0.1)
     parser.add_argument("--far-buffer", type=float, default=0.1)
     parser.add_argument(
@@ -272,7 +278,12 @@ def make_generated_valid_mask(
         if layout_valid_mask is None:
             raise ValueError("--generated-valid-mode layout requires a layout video from --layout-video or metadata")
         return layout_valid_mask.copy(), "layout_occupancy_threshold"
-    valid = np.isfinite(generated_range) & (generated_range > (args.min_range + args.valid_min_offset_m))
+    threshold_m = (
+        args.generated_valid_threshold_m
+        if args.generated_valid_threshold_m is not None
+        else args.min_range + args.valid_min_offset_m
+    )
+    valid = np.isfinite(generated_range) & (generated_range > threshold_m)
     return valid.astype(bool, copy=False), "predicted_range_threshold"
 
 
@@ -404,6 +415,11 @@ def main() -> None:
         "generated_missing_pixel_count": int((valid_mask & ~generated_valid_mask).sum()),
         "generated_valid_mode": args.generated_valid_mode,
         "generated_valid_source": generated_valid_source,
+        "generated_valid_threshold_m": (
+            args.generated_valid_threshold_m
+            if args.generated_valid_threshold_m is not None
+            else args.min_range + args.valid_min_offset_m
+        ),
         "point_cloud_video": str(pcd_path) if pcd_path is not None else None,
         "point_cloud_renderer": renderer,
         "display_frame": args.display_frame,

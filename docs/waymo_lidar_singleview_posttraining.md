@@ -521,7 +521,119 @@ latent weight smoke:
 shape=(2, 1, 8, 88, 160), min=1.0, max=2.0, mean=1.0683
 ```
 
-下一次训练建议从 `iter_000100000` 短续到 `120k`，并继续沿用固定 validation8（8 条数据、每卡一条）做对比；不要再更换验证集合，否则 53k/100k/valid-edge-weighted 结果不可直接比较。
+该建议已执行并在 `iter_000134000` 用固定 validation8 复测；结论见下节。后续不要再更换验证集合，否则 53k/100k/valid-edge-weighted 结果不可直接比较。
+
+### iter_000134000 valid + edge aware loss 验证
+
+2026-05-30 使用 valid + edge aware latent loss 从 `iter_000100000` 续训，训练在 `134300` 附近中断；本轮评估使用最近完整 checkpoint `iter_000134000`、EMA bf16、`num_steps=35`、`guidance=3`、fixed caption/text embedding、实际 `num_conditional_frames=1`。验证集合保持上一轮固定 validation8，仍是 8 条数据、每卡一条推理。
+
+validation8 mean 与 `iter_000100000` 对比：
+
+| metric | iter_000100000 | iter_000134000 | delta |
+| --- | ---: | ---: | ---: |
+| range MAE | 2.1381 | 2.1223 | -0.0158 |
+| range RMSE | 5.5193 | 5.4684 | -0.0509 |
+| range bias | -0.7871 | -0.7687 | +0.0184 |
+| occupancy precision / recall | 0.9392 / 0.9599 | 0.9395 / 0.9612 | +0.0003 / +0.0012 |
+| occupancy F1 / IoU | 0.9493 / 0.9054 | 0.9500 / 0.9067 | +0.0007 / +0.0013 |
+| edge precision / recall | 0.6762 / 0.8985 | 0.6762 / 0.8984 | +0.0000 / -0.0001 |
+| edge F1 / IoU | 0.7711 / 0.6280 | 0.7710 / 0.6280 | -0.0000 / -0.0000 |
+
+逐样本变化：
+
+| sample | MAE 100k -> 134k | RMSE 100k -> 134k | occ F1 100k -> 134k | edge F1 100k -> 134k |
+| --- | ---: | ---: | ---: | ---: |
+| `10203656353524179475_7625_000_7645_000_0` | 4.3758 -> 4.2342 | 10.1526 -> 9.7633 | 0.9309 -> 0.9356 | 0.8068 -> 0.8060 |
+| `1024360143612057520_3580_000_3600_000_0` | 1.0331 -> 1.0342 | 3.7972 -> 3.7975 | 0.9612 -> 0.9620 | 0.8090 -> 0.8098 |
+| `10247954040621004675_2180_000_2200_000_0` | 1.1286 -> 1.1327 | 2.7910 -> 2.7908 | 0.9559 -> 0.9564 | 0.7413 -> 0.7426 |
+| `10289507859301986274_4200_000_4220_000_0` | 1.7013 -> 1.7118 | 4.4741 -> 4.4804 | 0.9797 -> 0.9796 | 0.7546 -> 0.7543 |
+| `10335539493577748957_1372_870_1392_870_0` | 3.1734 -> 3.1818 | 7.2940 -> 7.2949 | 0.9671 -> 0.9670 | 0.7685 -> 0.7694 |
+| `10359308928573410754_720_000_740_000_0` | 0.8994 -> 0.8992 | 2.9106 -> 2.9087 | 0.9579 -> 0.9576 | 0.7579 -> 0.7581 |
+| `10448102132863604198_472_000_492_000_0` | 1.8919 -> 1.8881 | 5.3199 -> 5.3048 | 0.8643 -> 0.8646 | 0.7539 -> 0.7515 |
+| `10689101165701914459_2072_300_2092_300_0` | 2.9008 -> 2.8963 | 7.4150 -> 7.4063 | 0.9772 -> 0.9770 | 0.7763 -> 0.7765 |
+
+validation8 点云 totals（`predicted` generated occupancy）：
+
+```text
+GT valid                15949564
+generated valid         16289312
+matched valid           15357817
+generated extra           931495
+generated missing         591747
+extra/missing rate        5.84% / 3.71%
+```
+
+对比 `iter_000100000` 的 `5.86% / 3.81%`，extra 小幅下降 `2645` 点，missing 下降 `15593` 点；改善真实存在但幅度很小。validation8 点云 totals（`layout` generated occupancy）保持完全一致：extra/missing 仍是 `4181 / 10794 = 0.026% / 0.068%`，说明点云反投影和 layout occupancy 口径稳定。
+
+704x1280 decode 后 GT / GEN / abs error 诊断对比已补两个样本：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/validation8_rangemap_compare_704_g3_s35_text_cond1/10203656353524179475_7625_000_7645_000_0_iter_000134000_ema_g3_s35_text_cond1_gt_gen_absdiff_704x1280.mp4
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/validation8_rangemap_compare_704_g3_s35_text_cond1/10448102132863604198_472_000_492_000_0_iter_000134000_ema_g3_s35_text_cond1_gt_gen_absdiff_704x1280.mp4
+```
+
+704x1280 口径辅助指标：`102036...` 为 `range_mae_m=4.2654`、`range_rmse_m=9.8116`、`range_bias_m=-2.5027`、occupancy F1/IoU `0.9331 / 0.8746`；`104481...` 为 `range_mae_m=1.9039`、`range_rmse_m=5.3272`、`range_bias_m=-1.0016`、occupancy F1/IoU `0.8606 / 0.7553`。
+
+occupancy 最差样本 `10448102132863604198_472_000_492_000_0` 的点云视频：
+
+```text
+predicted mask: outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/pointcloud_vis_validation8_g3_s35_text_cond1/10448102132863604198_472_000_492_000_0/point_cloud/10448102132863604198_472_000_492_000_0_iter_000134000_ema_g3_s35_text_cond1.mp4
+layout mask:    outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/pointcloud_vis_validation8_g3_s35_text_cond1_layoutmask/10448102132863604198_472_000_492_000_0/point_cloud/10448102132863604198_472_000_492_000_0_iter_000134000_ema_g3_s35_text_cond1.mp4
+```
+
+validation8 结果文件：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/validation8_g3_s35_text_cond1/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/validation8_g3_s35_text_cond1_metrics/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/validation8_g3_s35_text_cond1_metrics/summary_iter_000134000_ema_g3_s35_text_cond1_validation8.json
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/pointcloud_summary_validation8_g3_s35_text_cond1/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/pointcloud_summary_validation8_g3_s35_text_cond1_layoutmask/
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000134000/validation8_rangemap_compare_704_g3_s35_text_cond1/
+```
+
+判断：valid + edge aware latent loss 在 `100k -> 134k` 的固定 validation8 上有弱正向效果，主要体现为 range MAE/RMSE、bias、occupancy recall/F1/IoU 和 predicted-mask 点云 missing 小幅改善；edge 指标基本不变。该效果不足以证明继续长训会显著提升，且 `104481...` 的 occupancy 仍是主要短板。当前决策是不继续训到 `150k`，该改动暂不作为主线路径合入；后续主线仍以 `iter_000100000` raw-online baseline 和固定 validation8 为主要对照。valid + edge aware loss 相关提交只作为实验记录保留，下一步应转向更直接的 occupancy/invalid 表示、decoder 后处理或阈值策略。2026-05-30 已在 `docs/waymo_lidar_wan21_vae_preprocessing.md` 补充固定 validation8 的 Wan2.1 VAE roundtrip 和阈值诊断，结论是当前 frozen VAE 自身会产生 invalid bleed，应优先验证显式 valid/invalid 表示或 LiDAR VAE fine-tune。2026-05-31 的 `polyphase3_repeat + roll=640` 单帧 VAE fine-tune 已把 validation8 frame0 mean MAE/F1 改到 `0.2397m / 0.9887`，但直接用于 29 帧时 range 指标反而差于 frozen Wan2.1，因此 `step_050000` 只作为单帧表示实验参考，不能替换当前 29-frame 主线 tokenizer；若继续 VAE 方向，应新开 `num_frames=29` smoke 或保护 temporal 模块后再评估。
+
+### iter_000100000 decode valid 后处理 sweep
+
+2026-05-30 在不重新推理、不改训练的前提下，给 `scripts/evaluate_waymo_lidar_rangemap_generation.py` 和 `scripts/visualize_waymo_lidar_generation.py` 补齐 generated valid mask 选项：
+
+```text
+--generated-valid-mode predicted|layout|matched_gt
+--generated-valid-threshold-m <meters>
+```
+
+默认仍等价于旧口径：`predicted` 且 threshold 为 `min_range + valid_min_offset_m = 5.25m`，所以历史指标不变。新增参数用于可复现实验 decode 后点云重建的 valid 策略；不要把 layout/matched_gt 模式当成无条件生成能力指标。
+
+在 `iter_000100000` 固定 validation8 上重评估四种策略，range MAE/RMSE/Bias 均保持旧值 `2.1381m / 5.5193m / -0.7871m`，因为 range 误差仍按 GT valid 区域计算；变化只来自 generated occupancy/edge mask：
+
+| generated valid strategy | occ F1 / IoU | edge F1 | generated valid | extra | missing |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `predicted @ 5.25m` | 0.9493 / 0.9054 | 0.7711 | 16276364 | 941733 | 608320 |
+| `predicted @ 5.50m` | **0.9527 / 0.9114** | **0.7765** | 15843216 | 661775 | 761510 |
+| `predicted @ 6.00m` | 0.9486 / 0.9044 | 0.7764 | 15502328 | 542205 | 982828 |
+| `layout` | 1.0000 / 1.0000 | 0.8144 | 15942951 | 0 | 0 |
+
+`5.50m` 是当前 predicted-mask 后处理里比较稳的折中：extra 比 `5.25m` 少约 `280k`，missing 多约 `153k`，occupancy/edge F1 同时小幅提升。`6.00m` 继续降噪但 missing 增幅过大，不建议作为默认点云重建阈值。`layout` gating 依赖 layout control occupancy，适合作为受控 point-cloud reconstruction 或可视化上界；它会隐藏模型自己的 occupancy 错误，因此不应用于主指标判断。
+
+结果目录：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/validation8_g3_s35_text_cond1_decode_valid_sweep_metrics/
+```
+
+单样本 point-cloud summary smoke 也验证了可视化脚本的 `--generated-valid-threshold-m 5.50` 入口，样本 `10448102132863604198_472_000_492_000_0` 输出：
+
+```text
+outputs/waymo_lidar_eval/waymo_lidar_wan21_raw_online_layout_fullfinetune_i2v_t8/iter_000100000/pointcloud_summary_decode_t5p50_smoke/10448102132863604198_472_000_492_000_0_iter_000100000_ema_g3_s35_text_cond1_point_cloud_summary.json
+```
+
+后续点云可视化可先用 `predicted @ 5.50m` 作为降噪对照；论文/主报告指标仍保留 `5.25m` baseline，并额外报告 threshold/gating sweep，避免后处理选择掩盖生成模型本身的问题。
+
+### official Waymo raw range image sanity
+
+2026-05-30 已新增 `scripts/inspect_waymo_official_lidar.py`，直接用官方 Waymo Open Dataset API 从 `/team/hyh/data/waymo/raw` 读取 range image 并重建点云。结果记录在 `docs/waymo_lidar_wan21_vae_preprocessing.md`：官方 TOP range image 是 `[64,2650,4]`，当前 `rds_hq_waymo/*/lidar_raw/*.tar` 等价于官方 TOP return1+return2 点云；主要损失不在 RDS raw 点坐标，而在后续把 native `[64,2650]` 和双 return 结构重新投影/压缩到当前训练用 `64x1280` range map。
+
 
 ### 历史 tokenizer-converted sanity 指标
 

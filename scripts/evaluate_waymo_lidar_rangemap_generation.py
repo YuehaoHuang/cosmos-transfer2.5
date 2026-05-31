@@ -28,6 +28,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-width", type=int, default=1280)
     parser.add_argument("--edge-threshold-m", type=float, default=1.0)
     parser.add_argument("--valid-min-offset-m", type=float, default=0.25)
+    parser.add_argument(
+        "--generated-valid-threshold-m",
+        type=float,
+        default=None,
+        help="Optional absolute generated-valid threshold in meters. Defaults to min_range + valid_min_offset_m.",
+    )
+    parser.add_argument(
+        "--generated-valid-mode",
+        default="predicted",
+        choices=["predicted", "layout", "matched_gt"],
+        help="How to build the generated valid mask for occupancy/edge metrics.",
+    )
     parser.add_argument("--layout-occupancy-threshold", type=int, default=90)
     parser.add_argument("--layout-edge-threshold", type=int, default=90)
     parser.add_argument("--decode-channel-mode", default="mean", choices=["first", "mean", "median", "concat_fuse"])
@@ -104,18 +116,42 @@ def layout_masks(path: Path, args: argparse.Namespace) -> tuple[np.ndarray, np.n
     return occupancy, edges
 
 
+def generated_valid_threshold(args: argparse.Namespace) -> float:
+    if args.generated_valid_threshold_m is not None:
+        return args.generated_valid_threshold_m
+    return args.min_range + args.valid_min_offset_m
+
+
+def generated_valid_mask(
+    generated_range: np.ndarray,
+    gt_valid: np.ndarray,
+    layout_valid: np.ndarray | None,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, str]:
+    if args.generated_valid_mode == "matched_gt":
+        return gt_valid.copy(), "matched_gt"
+    if args.generated_valid_mode == "layout":
+        if layout_valid is None:
+            raise ValueError("--generated-valid-mode layout requires --layout-video")
+        return layout_valid.copy(), "layout_occupancy_threshold"
+    threshold_m = generated_valid_threshold(args)
+    return (generated_range > threshold_m).astype(bool, copy=False), "predicted_range_threshold"
+
+
 def main() -> None:
     args = parse_args()
     generated_range = video_to_range(Path(args.generated_video), args)
     gt_range = video_to_range(Path(args.gt_video), args)
 
+    layout_valid = None
     if args.layout_video:
-        gt_valid, gt_edges = layout_masks(Path(args.layout_video), args)
+        layout_valid, gt_edges = layout_masks(Path(args.layout_video), args)
+        gt_valid = layout_valid
     else:
         gt_valid = gt_range > (args.min_range + args.valid_min_offset_m)
         gt_edges = edge_mask(gt_range, gt_valid, args.edge_threshold_m)
 
-    pred_valid = generated_range > (args.min_range + args.valid_min_offset_m)
+    pred_valid, pred_valid_source = generated_valid_mask(generated_range, gt_valid, layout_valid, args)
     pred_edges = edge_mask(generated_range, pred_valid, args.edge_threshold_m)
 
     valid = gt_valid & np.isfinite(generated_range) & np.isfinite(gt_range)
@@ -126,6 +162,14 @@ def main() -> None:
         "gt_video": args.gt_video,
         "layout_video": args.layout_video,
         "valid_pixel_count": int(valid.sum()),
+        "gt_valid_pixel_count": int(gt_valid.sum()),
+        "generated_valid_pixel_count": int(pred_valid.sum()),
+        "matched_valid_pixel_count": int((pred_valid & gt_valid).sum()),
+        "generated_extra_pixel_count": int((pred_valid & ~gt_valid).sum()),
+        "generated_missing_pixel_count": int((~pred_valid & gt_valid).sum()),
+        "generated_valid_mode": args.generated_valid_mode,
+        "generated_valid_source": pred_valid_source,
+        "generated_valid_threshold_m": generated_valid_threshold(args),
         "range_mae_m": float(np.mean(np.abs(valid_diff))) if valid_diff.size else None,
         "range_rmse_m": float(np.sqrt(np.mean(valid_diff**2))) if valid_diff.size else None,
         "range_bias_m": float(np.mean(valid_diff)) if valid_diff.size else None,
